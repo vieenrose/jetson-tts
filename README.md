@@ -1,5 +1,10 @@
 # jetson-tts — 8 kHz vocoder distillation for MeloTTS zh_en
 
+> **📦 Released model:** [Luigi/vits-melo-tts-zh_en-8k](https://huggingface.co/Luigi/vits-melo-tts-zh_en-8k)
+> — drop-in sherpa-onnx model dir (127 MB `model.onnx`, `sample_rate=8000`) with listening
+> samples (zh/en code-mixed, teacher-vs-student A/B), ear-test WAVs, and the
+> `DEVICE_ACCEPTANCE.md` checklist. PESQ-NB 2.90, predicted Jetson Nano A57 RTF ≈ 0.08–0.10.
+
 Replace the 44.1 kHz HiFi-GAN decoder of `vits-melo-tts-zh_en` (MeloTTS) with a retrained
 **lightweight 8 kHz vocoder**, so the full TTS runs in real time on a **Jetson Nano gen1 CPU**
 (4× Cortex-A57, ONNX Runtime CPU via sherpa-onnx). Target use: a phone attendant whose audio
