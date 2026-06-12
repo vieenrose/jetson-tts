@@ -14,9 +14,9 @@
 > | 2 | **0.435** | 4.51 |
 > | 4 | **0.342** | — |
 >
-> ~10× faster than stock and under realtime at every thread count. Note: the host→A57 factor
-> for this conv-heavy workload measured **~×13** (not the ×6–8 used in the prediction), so
-> actuals land above the predicted 0.08–0.10 band yet well inside every gate.
+> ~10× faster than stock and under realtime at every thread count, inside every acceptance
+> gate. Calibration note: the host→A57 factor for this conv-heavy workload measured **~×13**
+> (the pre-acceptance docs predicted with ×6–8 — superseded by the table above).
 
 Replace the 44.1 kHz HiFi-GAN decoder of `vits-melo-tts-zh_en` (MeloTTS) with a retrained
 **lightweight 8 kHz vocoder**, so the full TTS runs in real time on a **Jetson Nano gen1 CPU**
@@ -38,7 +38,7 @@ from MeloTTS's own output. Same text → same speech, just 8 kHz and cheap.
   - Shared front end resamples `z` 86.13 Hz → 125 Hz so an integer ×64 lands on **exactly 8000 Hz**.
 - **Export:** drop-in `model.onnx` (melo enc/flow + student dec, `sample_rate=8000`, opset 17,
   fp32, no custom ops) that the stock `sherpa-onnx-offline-tts` runs unmodified. (`scripts/export_full_onnx.py`)
-- **Gates:** host x86 ORT-CPU RTF @1/2/4 threads (predicts A57 RTF ×6–8), PESQ-NB + MCD vs the
+- **Gates:** host x86 ORT-CPU RTF @1/2/4 threads (predicts A57 RTF at the measured ×13 factor), PESQ-NB + MCD vs the
   teacher, ear-test through a simulated G.711 μ-law channel.
 
 ## Layout
