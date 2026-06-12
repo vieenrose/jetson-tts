@@ -26,6 +26,21 @@ leaves through an 8 kHz G.711 channel — rendering 44.1 kHz wastes ≥80 % of v
 The voice, prosody, and front end are **unchanged** — only the decoder is retrained, distilled
 from MeloTTS's own output. Same text → same speech, just 8 kHz and cheap.
 
+## Usage
+
+> ⚠️ **Use `--sid 1` for Chinese (ZH).** This model inherits MeloTTS's `spk2id = {'ZH': 1}`:
+> speaker id **1** is the only valid voice. Synthesizing with `--sid 0` (or any other id) feeds
+> the wrong speaker embedding `g` into the decoder — the output is silent/garbled, not just a
+> different voice. Any wrapper that defaults the language to English (and therefore speaker 0)
+> will produce silence on ZH text; pass the language/speaker explicitly.
+
+```bash
+sherpa-onnx-offline-tts \
+  --vits-model=model.onnx --vits-tokens=tokens.txt --vits-lexicon=lexicon.txt \
+  --vits-dict-dir=dict --sid=1 \
+  --output-filename=out.wav "您好請稍候"
+```
+
 ## Approach
 - **Teacher / data:** stock MeloTTS zh_en synthesizes a zh/en code-mixed receptionist corpus;
   we dump the decoder-input latent `z[192,T]` + speaker embedding `g[256]` paired with the
