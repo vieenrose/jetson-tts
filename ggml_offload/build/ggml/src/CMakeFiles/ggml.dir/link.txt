@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC -O3 -DNDEBUG -shared -Wl,-soname,libggml.so -o libggml.so "CMakeFiles/ggml.dir/ggml-backend-reg.cpp.o"  -Wl,-rpath,/home/luigi/ipho-2.0/ipho_8port_r5292/user/jetson-tts/ggml_offload/build/ggml/src: -ldl libggml-cpu.so libggml-base.so 
