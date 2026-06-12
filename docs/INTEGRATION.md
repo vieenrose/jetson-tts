@@ -43,4 +43,27 @@ the WAV header and any downstream resampler pick it up automatically.
 - fp32, opset 17, no custom ops — runs on the sherpa-onnx-pinned ORT (~1.17) CPU build.
 - Voice/prosody/front end are untouched; identical text yields the same speech, just 8 kHz.
 
+## zh-TW (Traditional Chinese) input — supported, with front-end caveats
+Traditional Chinese input **works**. Melo's Chinese frontend does **no** Traditional→Simplified
+conversion — it feeds characters straight to `pypinyin`, which reads Traditional correctly.
+Verified: 15/15 Traditional/Simplified pairs (幫轉經陳鐵颱濕會廣聯…) give identical pinyin; full
+zh-TW lines phonemize cleanly (e.g. `分機533` → 五百三十三 via cn2an). The whole training corpus
+is Traditional and synthesizes fine. The on-device `lexicon.txt` covers the CJK range incl.
+Traditional chars, so device-side lookup behaves the same.
+
+Two caveats, **both in the front end** (token/pinyin generation) — the decoder distillation does
+**not** touch them, so they are identical to the stock 44.1 kHz model:
+
+1. **Accent is Mainland Putonghua, not Taiwan Guoyu.** `MeloTTS-Chinese` is trained on Mainland
+   Mandarin, so Taiwan-specific readings come out Mainland: 垃圾 `lā jī` (TW lè sè), 和(conj.)
+   `hé` (TW hàn), 研究 `yán jiū` (TW yán jiù), 企業 `qǐ yè` (TW qì yè). Characters are right;
+   accent/prosody are not Taiwanese.
+2. **Polyphone errors exist** (inherent to the frontend, not Traditional-specific): e.g. 銀行 →
+   `yín xíng` (should be *háng*), 長度 → `zhǎng dù` (should be *cháng*). Common words mostly fine.
+
+**Implication:** whatever zh-TW quality the stock 44.1 kHz model gives, this 8 kHz drop-in
+reproduces **identically** (phonemes/accent/prosody come from the unchanged teacher). Fixing the
+accent/polyphones is a separate front-end effort (Taiwan-tuned lexicon, or OpenCC + Taiwan-reading
+overrides) — out of scope for the decoder replacement.
+
 See `DEVICE_ACCEPTANCE.md` for the speed/quality numbers to reproduce on the Nano.
