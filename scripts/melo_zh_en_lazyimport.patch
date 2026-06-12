@@ -1,0 +1,169 @@
+diff --git a/melo/text/__init__.py b/melo/text/__init__.py
+index 6e482be..0f95e3b 100644
+--- a/melo/text/__init__.py
++++ b/melo/text/__init__.py
+@@ -21,15 +21,19 @@ def cleaned_text_to_sequence(cleaned_text, tones, language, symbol_to_id=None):
+ 
+ 
+ def get_bert(norm_text, word2ph, language, device):
+-    from .chinese_bert import get_bert_feature as zh_bert
+-    from .english_bert import get_bert_feature as en_bert
+-    from .japanese_bert import get_bert_feature as jp_bert
+-    from .chinese_mix import get_bert_feature as zh_mix_en_bert
+-    from .spanish_bert import get_bert_feature as sp_bert
+-    from .french_bert import get_bert_feature as fr_bert
+-    from .korean import get_bert_feature as kr_bert
+-
+-    lang_bert_func_map = {"ZH": zh_bert, "EN": en_bert, "JP": jp_bert, 'ZH_MIX_EN': zh_mix_en_bert, 
+-                          'FR': fr_bert, 'SP': sp_bert, 'ES': sp_bert, "KR": kr_bert}
+-    bert = lang_bert_func_map[language](norm_text, word2ph, device)
+-    return bert
++    # jetson-tts patch: import only the requested language's BERT backend so zh_en
++    # runs without JP/KR/FR/ES deps installed.
++    _bert_module_attr = {
++        "ZH": (".chinese_bert", "get_bert_feature"),
++        "EN": (".english_bert", "get_bert_feature"),
++        "JP": (".japanese_bert", "get_bert_feature"),
++        "ZH_MIX_EN": (".chinese_mix", "get_bert_feature"),
++        "FR": (".french_bert", "get_bert_feature"),
++        "SP": (".spanish_bert", "get_bert_feature"),
++        "ES": (".spanish_bert", "get_bert_feature"),
++        "KR": (".korean", "get_bert_feature"),
++    }
++    import importlib
++    mod_name, attr = _bert_module_attr[language]
++    mod = importlib.import_module(mod_name, __package__)
++    return getattr(mod, attr)(norm_text, word2ph, device)
+diff --git a/melo/text/cleaner.py b/melo/text/cleaner.py
+index fdf2609..ab19755 100644
+--- a/melo/text/cleaner.py
++++ b/melo/text/cleaner.py
+@@ -1,9 +1,25 @@
+-from . import chinese, japanese, english, chinese_mix, korean, french, spanish
+ from . import cleaned_text_to_sequence
+ import copy
++import importlib
+ 
+-language_module_map = {"ZH": chinese, "JP": japanese, "EN": english, 'ZH_MIX_EN': chinese_mix, 'KR': korean,
+-                    'FR': french, 'SP': spanish, 'ES': spanish}
++# jetson-tts patch: import language backends lazily so that zh_en runs without the
++# Japanese/Korean/French/Spanish g2p deps (MeCab, gruut, g2pkk, ...) installed.
++_LANG_MODULE_NAMES = {
++    "ZH": "chinese", "JP": "japanese", "EN": "english", "ZH_MIX_EN": "chinese_mix",
++    "KR": "korean", "FR": "french", "SP": "spanish", "ES": "spanish",
++}
++_lang_module_cache = {}
++
++
++class _LazyLangModuleMap:
++    def __getitem__(self, language):
++        if language not in _lang_module_cache:
++            name = _LANG_MODULE_NAMES[language]
++            _lang_module_cache[language] = importlib.import_module(f".{name}", __package__)
++        return _lang_module_cache[language]
++
++
++language_module_map = _LazyLangModuleMap()
+ 
+ 
+ def clean_text(text, language):
+diff --git a/melo/text/english.py b/melo/text/english.py
+index d1152fe..9f743a8 100644
+--- a/melo/text/english.py
++++ b/melo/text/english.py
+@@ -8,7 +8,15 @@ from . import symbols
+ from .english_utils.abbreviations import expand_abbreviations
+ from .english_utils.time_norm import expand_time_english
+ from .english_utils.number_norm import normalize_numbers
+-from .japanese import distribute_phone
++# jetson-tts patch: inline distribute_phone to avoid importing japanese.py
++# (which has Japanese-only module-level side effects: MeCab/pykakasi/JP BERT tokenizer).
++def distribute_phone(n_phone, n_word):
++    phones_per_word = [0] * n_word
++    for task in range(n_phone):
++        min_tasks = min(phones_per_word)
++        min_index = phones_per_word.index(min_tasks)
++        phones_per_word[min_index] += 1
++    return phones_per_word
+ 
+ from transformers import AutoTokenizer
+ 
+diff --git a/melo/text/japanese.py b/melo/text/japanese.py
+index ebbbd39..522c892 100644
+--- a/melo/text/japanese.py
++++ b/melo/text/japanese.py
+@@ -8,10 +8,12 @@ from transformers import AutoTokenizer
+ from . import symbols
+ punctuation = ["!", "?", "…", ",", ".", "'", "-"]
+ 
++# jetson-tts patch: defer MeCab import so english.py can borrow distribute_phone()
++# without MeCab installed. Only actual Japanese g2p needs MeCab.
+ try:
+     import MeCab
+-except ImportError as e:
+-    raise ImportError("Japanese requires mecab-python3 and unidic-lite.") from e
++except ImportError:
++    MeCab = None
+ from num2words import num2words
+ 
+ _CONVRULES = [
+@@ -364,11 +366,20 @@ def hira2kata(text: str) -> str:
+ 
+ _SYMBOL_TOKENS = set(list("・、。？！"))
+ _NO_YOMI_TOKENS = set(list("「」『』―（）［］[]"))
+-_TAGGER = MeCab.Tagger()
++_TAGGER = None  # jetson-tts patch: lazily created; only Japanese g2p needs MeCab
++
++
++def _get_tagger():
++    global _TAGGER
++    if _TAGGER is None:
++        if MeCab is None:
++            raise ImportError("Japanese requires mecab-python3 and unidic-lite.")
++        _TAGGER = MeCab.Tagger()
++    return _TAGGER
+ 
+ 
+ def text2kata(text: str) -> str:
+-    parsed = _TAGGER.parse(text)
++    parsed = _get_tagger().parse(text)
+     res = []
+     for line in parsed.split("\n"):
+         if line == "EOS":
+@@ -536,21 +547,27 @@ def replace_punctuation(text):
+ 
+     return replaced_text
+ 
+-from pykakasi import kakasi
+-# Initialize kakasi object
+-kakasi = kakasi()
+-# Set options for converting Chinese characters to Katakana
+-kakasi.setMode("J", "K")  # Chinese to Katakana
+-kakasi.setMode("H", "K")  # Hiragana to Katakana
+-# Convert Chinese characters to Katakana
+-conv = kakasi.getConverter()
++# jetson-tts patch: pykakasi is Japanese-only; load lazily so english.py can import
++# distribute_phone from this module without pykakasi installed.
++conv = None
++
++
++def _get_kakasi_conv():
++    global conv
++    if conv is None:
++        from pykakasi import kakasi as _kakasi
++        k = _kakasi()
++        k.setMode("J", "K")  # Chinese to Katakana
++        k.setMode("H", "K")  # Hiragana to Katakana
++        conv = k.getConverter()
++    return conv
+ 
+ def text_normalize(text):
+     res = unicodedata.normalize("NFKC", text)
+     res = japanese_convert_numbers_to_words(res)
+     res = "".join([i for i in res if is_japanese_character(i)])
+     res = replace_punctuation(res)
+-    res = conv.do(res)
++    res = _get_kakasi_conv().do(res)
+     return res
+ 
+ 

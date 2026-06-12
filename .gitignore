@@ -1,0 +1,31 @@
+# Python env (rebuild via docs/ENV_SETUP.md)
+.venv/
+__pycache__/
+*.pyc
+
+# Generated training data (17h teacher dump — reproducible via scripts/dump_teacher.py)
+data/pairs/
+data/eval_pairs/
+data/_*/
+data/zh_config.json
+
+# Model artifacts (large; reproducible)
+*.onnx
+*.pt
+*.pth
+student/runs/
+export/*/
+eval/wavs/
+eval/*.wav
+eval/_*.wav
+
+# Logs / scratch
+logs/
+*.log
+nohup.out
+
+# Third-party source clones (cloned + patched via scripts/melo_zh_en_lazyimport.patch)
+third_party/MeloTTS/
+
+# OS
+.DS_Store
