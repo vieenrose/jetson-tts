@@ -1,0 +1,10 @@
+{
+  "ckpt": "student/runs/hifigan/best.pt",
+  "arch": "hifigan",
+  "step": 14000,
+  "n": 125,
+  "PESQ_NB": 2.700308418273926,
+  "PESQ_NB_g711": 2.7039346256256103,
+  "MCD_dB": 11.521555252075196,
+  "MCD_dB_g711": 11.53819189453125
+}

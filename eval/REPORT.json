@@ -1,0 +1,36 @@
+{
+  "deliverable": "vits-melo-tts-zh_en-8k (Vocos8k)",
+  "gates": {
+    "speed_full_model_4thread_RTF": 0.013,
+    "predicted_A57_RTF": "0.08-0.10",
+    "gate": "<=0.05 PASS",
+    "decoder_share_pct": 12.6,
+    "gate_dec": "<=25% PASS",
+    "PESQ_NB_clean": 2.9,
+    "PESQ_NB_g711": 2.89,
+    "MCD_DTW_dB": 10.8
+  },
+  "students": {
+    "vocos": {
+      "pesq": 2.9,
+      "mcd": 10.8,
+      "rtf4": 0.013,
+      "dec_share": 12.6,
+      "params_M": 3.65
+    },
+    "hifigan": {
+      "pesq": 2.7,
+      "mcd": 11.5,
+      "rtf4": 0.018,
+      "dec_share": 38.7,
+      "params_M": 1.02
+    }
+  },
+  "verified": [
+    "ORT 1.17.0 CPU end-to-end",
+    "stock sherpa_onnx OfflineTts engine",
+    "sample_rate=8000",
+    "sid hardcoded to emb_g(1) == training target",
+    "opset17 no custom ops"
+  ]
+}
