@@ -1,1 +1,0 @@
-/usr/bin/c++ -O3 -DNDEBUG "CMakeFiles/melo8k-parity.dir/src/melo8k.cpp.o" -o melo8k-parity  -Wl,-rpath,/home/luigi/ipho-2.0/ipho_8port_r5292/user/jetson-tts/ggml_offload/build/ggml/src ggml/src/libggml.so ggml/src/libggml-cpu.so ggml/src/libggml-base.so 

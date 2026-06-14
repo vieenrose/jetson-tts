@@ -75,6 +75,12 @@ python -m student.train --arch hifigan --device cuda:0 --out student/runs/hifiga
 python scripts/export_full_onnx.py --ckpt student/runs/vocos/best.pt --out-dir export/vits-melo-tts-zh_en-8k
 ```
 
+## GPU offload (moved out)
+The ggml-CUDA offload work — running flow+dec on the Jetson Nano's Maxwell GPU so TTS uses
+≤1 CPU thread during a live call — has moved to its own repo:
+**https://github.com/vieenrose/edge-speech-gpu-bench**. This repo stays focused on the
+CPU-only distillation + drop-in ONNX.
+
 ## License
 Code: MIT. Derives from MeloTTS (MIT, MyShell.ai) and references the sherpa-onnx (k2-fsa, Apache-2.0)
 melo export script. Attribution retained in `third_party/`.
