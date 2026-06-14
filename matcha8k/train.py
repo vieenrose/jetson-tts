@@ -46,6 +46,7 @@ def main():
     ap.add_argument("--lambda-stft", type=float, default=2.0)
     ap.add_argument("--lambda-fm", type=float, default=2.0)
     ap.add_argument("--lambda-adv", type=float, default=1.0)
+    ap.add_argument("--init-from", default=None, help="warm-start generator G from this .pt checkpoint")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     dev = torch.device(args.device)
@@ -55,6 +56,9 @@ def main():
     print(f"[matcha8k] train {len(ds)} val {len(val)} steps {args.steps}")
     G = VocosMel8k().to(dev)
     D = MultiDiscriminator().to(dev)
+    if args.init_from:
+        ck = torch.load(args.init_from, map_location=dev, weights_only=False)
+        G.load_state_dict(ck["G"]); print(f"[matcha8k] warm-started G from {args.init_from} (PESQ {ck.get('pesq')})")
     print(f"[matcha8k] generator params {sum(p.numel() for p in G.parameters())/1e6:.2f}M")
     optG = torch.optim.AdamW(G.parameters(), lr=args.lr, betas=(0.8, 0.99))
     optD = torch.optim.AdamW(D.parameters(), lr=args.lr, betas=(0.8, 0.99))

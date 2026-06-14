@@ -43,6 +43,8 @@ def main():
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--num-shards", type=int, default=1)
+    ap.add_argument("--temp", type=float, default=0.667, help="CFM temperature (match inference noise_scale)")
+    ap.add_argument("--n-steps", type=int, default=3, help="CFM ODE steps (match inference / steps-N export)")
     args = ap.parse_args()
     dev = torch.device(args.device)
     model = build_model()
@@ -79,7 +81,8 @@ def main():
             yn = torch.nn.functional.pad(yn, (0, Tp - T))
         x = torch.tensor([ids], dtype=torch.long, device=dev)
         try:
-            mel = tf_mel(model, x, torch.tensor([x.shape[1]], device=dev), yn, torch.tensor([Tp], device=dev))[0].cpu().numpy()
+            mel = tf_mel(model, x, torch.tensor([x.shape[1]], device=dev), yn, torch.tensor([Tp], device=dev),
+                         n_steps=args.n_steps, temperature=args.temp)[0].cpu().numpy()
             mel = mel[:, :T]                                    # trim pad back to real audio length
         except Exception as e:
             print(f"[skip {uid}] {e}", file=sys.stderr); continue

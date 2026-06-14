@@ -103,12 +103,24 @@ def main():
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--save-every", type=int, default=2000)
     ap.add_argument("--log-every", type=int, default=100)
+    ap.add_argument("--freeze-encoder", action="store_true",
+                    help="freeze encoder + duration predictor + embeddings, train decoder only (zh-TW accent recipe, arXiv 2305.11320)")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     dev = torch.device(args.device)
     model = build_model().to(dev).train()
     mm, ms = float(model.mel_mean), float(model.mel_std)
     print(f"loaded matcha ckpt; mel_mean {mm:.3f} mel_std {ms:.3f}")
+    if args.freeze_encoder:
+        # research recipe: freeze content/timing (encoder, duration predictor, embeddings) -> preserves
+        # pronunciation/English; train the CFM decoder -> learns the TW-accent acoustic on the qwen manifold
+        # (so it stays renderable by the natural-mel vocoder).
+        for name, p in model.named_parameters():
+            if not name.startswith("decoder."):
+                p.requires_grad = False
+        trn = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        tot = sum(p.numel() for p in model.parameters())
+        print(f"FROZEN encoder/dp/emb; training decoder only: {trn/1e6:.2f}M/{tot/1e6:.1f}M ({100*trn/tot:.1f}%)")
     # load precomputed frontend ids if present (avoids espeak in dataloader workers -> no hang)
     ids_path = os.path.join(args.root + "_ids.json")
     if os.path.exists(ids_path):
@@ -120,7 +132,7 @@ def main():
     print(f"dataset: {len(ds)} clips")
     dl = torch.utils.data.DataLoader(ds, batch_size=args.batch, shuffle=True, num_workers=args.workers,
                                      collate_fn=collate, drop_last=True, persistent_workers=args.workers > 0)
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.98))
+    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr, betas=(0.9, 0.98))
     step = 0; it = iter(dl); import time; t0 = time.time()
     while step < args.steps:
         try: X, xl, Y, yl = next(it)
