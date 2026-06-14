@@ -17,8 +17,11 @@ Measured Jetson Nano RTF (melo-8k, stock `sherpa-onnx-offline-tts`, ORT CPU): **
 1/2/4 threads (~10× faster than the stock 44.1 kHz melo), under real-time at every thread count. The
 host→A57 factor for this conv-heavy workload measured **~×13**.
 
-> ⚠️ **MeloTTS model: use `--sid 1` for Chinese** (`spk2id={'ZH':1}`); `--sid 0` feeds the wrong
-> speaker embedding → silent/garbled. Matcha models are single-speaker (sid hardcoded in metadata).
+> **Speaker id:** all models are single-speaker. sherpa-onnx hardcodes the graph speaker to the
+> model's metadata `speaker_id` (melo: 1; matcha: the single voice), so `--sid` is effectively
+> ignored — any value, including the default `0`, produces correct audio (sherpa may log a benign
+> "Use sid=0" notice). The speaker embedding only matters if you bypass sherpa and drive the raw
+> ONNX yourself (then MeloTTS needs `emb_g(1)`, not 0). Verified in sherpa-onnx for both models.
 
 ## Two distillation tracks
 
