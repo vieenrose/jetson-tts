@@ -69,7 +69,10 @@ class TWSet(torch.utils.data.Dataset):
         uid, text, wav = self.items[i]
         ids = self.ids_cache.get(uid)
         if ids is None:
-            ids = self.fe.text_to_ids(text); self.ids_cache[uid] = ids
+            # frontend (espeak) in workers can hang; precompute ids offline instead.
+            if self.fe is None:
+                return torch.zeros(2, dtype=torch.long), torch.zeros(80, 8)
+            ids = self.fe.text_to_ids(text)
         x = torch.tensor(ids, dtype=torch.long)
         try:
             y = wav_to_mel(wav, self.mm, self.ms)
@@ -106,8 +109,14 @@ def main():
     model = build_model().to(dev).train()
     mm, ms = float(model.mel_mean), float(model.mel_std)
     print(f"loaded matcha ckpt; mel_mean {mm:.3f} mel_std {ms:.3f}")
-    fe = MatchaFrontend()
-    ds = TWSet(args.root, fe, mm, ms, {})
+    # load precomputed frontend ids if present (avoids espeak in dataloader workers -> no hang)
+    ids_path = os.path.join(args.root + "_ids.json")
+    if os.path.exists(ids_path):
+        ids_cache = json.load(open(ids_path)); fe = None
+        print(f"loaded {len(ids_cache)} precomputed ids; espeak disabled in workers")
+    else:
+        ids_cache = {}; fe = MatchaFrontend()
+    ds = TWSet(args.root, fe, mm, ms, ids_cache)
     print(f"dataset: {len(ds)} clips")
     dl = torch.utils.data.DataLoader(ds, batch_size=args.batch, shuffle=True, num_workers=args.workers,
                                      collate_fn=collate, drop_last=True, persistent_workers=args.workers > 0)
