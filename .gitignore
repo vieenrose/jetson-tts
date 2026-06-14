@@ -36,3 +36,11 @@ matcha_eval/
 # large model downloads + qwen corpus (local)
 models/
 .venv-qwen/
+
+# training checkpoints (large, reproducible)
+matcha8k/ft_runs/
+matcha8k/runs/
+student/runs/
+# cloned third-party source (clone per docs/ENV_SETUP; matcha8k plan)
+third_party/BreezyVoice/
+third_party/Matcha-TTS/

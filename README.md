@@ -1,86 +1,75 @@
-# jetson-tts — 8 kHz vocoder distillation for MeloTTS zh_en
+# jetson-tts — lightweight 8 kHz zh/en (and zh-TW) TTS for the Jetson Nano
 
-> **📦 Released model:** [Luigi/vits-melo-tts-zh_en-8k](https://huggingface.co/Luigi/vits-melo-tts-zh_en-8k)
-> — drop-in sherpa-onnx model dir (127 MB `model.onnx`, `sample_rate=8000`) with listening
-> samples (zh/en code-mixed, teacher-vs-student A/B), ear-test WAVs, and the
-> `DEVICE_ACCEPTANCE.md` checklist. PESQ-NB 2.90.
+Distill best-in-class open-source **Chinese/English code-mixed** TTS models into **8 kHz** drop-in
+[sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) model dirs that run in real time on a **Jetson
+Nano gen1 CPU** (4× Cortex-A57). Target: a phone attendant whose audio leaves through an 8 kHz G.711
+channel — rendering 44.1/16 kHz wastes most of the vocoder compute.
 
-> **✅ Device-accepted on a real Jetson Nano gen1 (2026-06-12)** — measured with the stock
-> `sherpa-onnx-offline-tts` (ORT CPU), zh/en code-mixed sentence, 8 kHz mono verified:
->
-> | threads | RTF measured | stock 44.1 kHz melo |
-> |--------:|------:|------:|
-> | 1 | **0.788** | 8.50 |
-> | 2 | **0.435** | 4.51 |
-> | 4 | **0.342** | — |
->
-> ~10× faster than stock and under realtime at every thread count, inside every acceptance
-> gate. Calibration note: the host→A57 factor for this conv-heavy workload measured **~×13**
-> (the pre-acceptance docs predicted with ×6–8 — superseded by the table above).
+## Released models (Hugging Face)
+| model | what it is | status |
+|---|---|---|
+| [Luigi/vits-melo-tts-zh_en-8k](https://huggingface.co/Luigi/vits-melo-tts-zh_en-8k) | MeloTTS zh_en, HiFi-GAN decoder distilled → 8 kHz Vocos | **device-accepted on real Nano**, PESQ-NB 2.90 |
+| [Luigi/matcha-zh-en-8k](https://huggingface.co/Luigi/matcha-zh-en-8k) | Matcha-TTS zh-en, 16 kHz vocoder distilled → 8 kHz | best code-mixing; PESQ-NB 3.80 |
+| [Luigi/matcha-zh-tw-en-8k](https://huggingface.co/Luigi/matcha-zh-tw-en-8k) | matcha-zh-en-8k + **Taiwan-readings lexicon** | **zh-TW deliverable** (readings ✓, accent: see below) |
+| [Luigi/zh-en-tts-8k-comparison](https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison) | A/B listening sets (dataset) | — |
 
-Replace the 44.1 kHz HiFi-GAN decoder of `vits-melo-tts-zh_en` (MeloTTS) with a retrained
-**lightweight 8 kHz vocoder**, so the full TTS runs in real time on a **Jetson Nano gen1 CPU**
-(4× Cortex-A57, ONNX Runtime CPU via sherpa-onnx). Target use: a phone attendant whose audio
-leaves through an 8 kHz G.711 channel — rendering 44.1 kHz wastes ≥80 % of vocoder compute.
+Measured Jetson Nano RTF (melo-8k, stock `sherpa-onnx-offline-tts`, ORT CPU): **0.79 / 0.44 / 0.34** at
+1/2/4 threads (~10× faster than the stock 44.1 kHz melo), under real-time at every thread count. The
+host→A57 factor for this conv-heavy workload measured **~×13**.
 
-The voice, prosody, and front end are **unchanged** — only the decoder is retrained, distilled
-from MeloTTS's own output. Same text → same speech, just 8 kHz and cheap.
+> ⚠️ **MeloTTS model: use `--sid 1` for Chinese** (`spk2id={'ZH':1}`); `--sid 0` feeds the wrong
+> speaker embedding → silent/garbled. Matcha models are single-speaker (sid hardcoded in metadata).
 
-## Usage
+## Two distillation tracks
 
-> ⚠️ **Use `--sid 1` for Chinese (ZH).** This model inherits MeloTTS's `spk2id = {'ZH': 1}`:
-> speaker id **1** is the only valid voice. Synthesizing with `--sid 0` (or any other id) feeds
-> the wrong speaker embedding `g` into the decoder — the output is silent/garbled, not just a
-> different voice. Any wrapper that defaults the language to English (and therefore speaker 0)
-> will produce silence on ZH text; pass the language/speaker explicitly.
+### A. MeloTTS zh_en → 8 kHz (`student/`)
+VITS-family: dump the decoder-input latent `z[192,T]` + speaker emb `g[256]` from stock melo
+(**with `--zero-bert`** to match the deployed sherpa graph), pair with 8 kHz audio, train a
+lightweight vocoder. Two students compared: `HiFiGAN8k` (1.0M) and the winner `Vocos8k` (3.7M,
+ConvNeXt @125 Hz + iSTFT head). `z` is resampled 86.13→125 Hz so an integer ×64 lands on exactly 8000 Hz.
 
-```bash
-sherpa-onnx-offline-tts \
-  --vits-model=model.onnx --vits-tokens=tokens.txt --vits-lexicon=lexicon.txt \
-  --vits-dict-dir=dict --sid=1 \
-  --output-filename=out.wav "您好請稍候"
-```
+### B. Matcha-TTS zh-en → 8 kHz (`matcha8k/`)
+2-stage (acoustic → mel, separate Vocos vocoder). Keep the acoustic model; distill a new **8 kHz Vocos
+vocoder** (mel[80,T] → mag/x/y, sherpa iSTFT n_fft=512/hop=128). Tokens captured from sherpa's own
+debug frontend; vocoder trained on real (mel, 8 kHz) pairs. PESQ-NB 3.80.
 
-## Approach
-- **Teacher / data:** stock MeloTTS zh_en synthesizes a zh/en code-mixed receptionist corpus;
-  we dump the decoder-input latent `z[192,T]` + speaker embedding `g[256]` paired with the
-  audio downsampled to 8 kHz. No human speech dataset needed. (`scripts/dump_teacher.py`)
-  - **Must dump with `--zero-bert`**: the deployed sherpa-onnx binary never computes BERT, so a
-    faithful drop-in distills on the bert=0 latent distribution.
-- **Students (two, compared):**
-  - `HiFiGAN8k` — re-derived HiFi-GAN upsample stack for 8 kHz (1.0M params).
-  - `Vocos8k` — ConvNeXt @ 125 Hz + iSTFT head (3.7M params; the expected speed winner).
-  - Shared front end resamples `z` 86.13 Hz → 125 Hz so an integer ×64 lands on **exactly 8000 Hz**.
-- **Export:** drop-in `model.onnx` (melo enc/flow + student dec, `sample_rate=8000`, opset 17,
-  fp32, no custom ops) that the stock `sherpa-onnx-offline-tts` runs unmodified. (`scripts/export_full_onnx.py`)
-- **Gates:** host x86 ORT-CPU RTF @1/2/4 threads (predicts A57 RTF at the measured ×13 factor), PESQ-NB + MCD vs the
-  teacher, ear-test through a simulated G.711 μ-law channel.
+## zh-TW (Taiwan Mandarin) — what works and what doesn't
+- **Readings (字音) — ✅ shipped.** A curated CN→TW reading-override lexicon (`data/tw_readings/`,
+  `scripts/apply_tw_lexicon.py`): 垃圾→lèsè, 期→qí, 究→jiù, 質→zhí, 危→wéi, 企→qì… On-device lexicon
+  swap only, no retrain, keeps English/code-mixing. Validated. → `Luigi/matcha-zh-tw-en-8k`.
+- **Accent (腔調) — ✗ out of scope for this edge stack.** Authentic Taiwan accent (reduced retroflex,
+  TW prosody) requires changing the acoustic model. Extensive attempts (full fine-tune; LoRA on
+  encoder/duration/decoder-attention; teacher-forced-mel vocoder co-training) could not reach clean
+  quality: changing the accent breaks the base acoustic↔vocoder co-training, and re-pairing on
+  flow-matching mels caps quality (PESQ ~1.2). Heavy LLM-TTS teachers (BreezyVoice/CosyVoice,
+  Qwen3-TTS) do accent+quality natively but are far too large for the Nano. It's a device-capability
+  limit, not a tuning bug. See `docs/TW_ACCENT_RESEARCH.md` and `docs/ZH_TW_PLAN.md`.
+
+A clean way to *generate* TW-accented code-mixed audio offline (e.g. as a teacher): **Qwen3-TTS-Base
+voice-cloning** an edge-tts zh-TW reference produced excellent results — but only as an offline data
+generator, not an edge-deployable model.
+
+## Evaluation tooling
+- Host x86 ORT-CPU RTF @1/2/4 threads + per-node profile (`scripts/bench_*.py`).
+- PESQ-NB + MCD-DTW vs teacher, simulated G.711 μ-law channel (`scripts/eval_quality.py`, `scripts/g711.py`).
+- **ASR intelligibility gate** for zh/en (English-word recall + CER): faster-whisper and the
+  **X-ASR-zh-en** sherpa Zipformer (`matcha8k/asr_verify.py`, `matcha8k/xasr_verify.py`). Use ≥70-word
+  eval sets — small sets are too noisy (a lesson learned the hard way).
 
 ## Layout
 ```
-student/        student vocoders, losses, dataset, training, audio framing config
-scripts/        teacher dump, corpus gen, ONNX export (dec-only + full), bench, eval, G.711
-docs/           ENV_SETUP, TEACHER_DECODER_CONFIG, ORT_COMPAT, INTEGRATION, (DEVICE_ACCEPTANCE)
-data/text/      code-mixed corpus (rendered pairs are gitignored — regenerate via scripts)
-third_party/    melo lazy-import patch + sherpa-onnx melo export reference
-```
-
-## Reproduce
-See `docs/ENV_SETUP.md` (isolated venv, cu128 torch, MeloTTS zh/en-only install + patch), then:
-```bash
-python scripts/build_corpus_text.py --n 15000 --out data/text/corpus.tsv
-python scripts/dump_teacher.py --corpus data/text/train.tsv --out data/pairs --zero-bert  # per GPU shard
-python -m student.train --arch vocos   --device cuda:1 --out student/runs/vocos
-python -m student.train --arch hifigan --device cuda:0 --out student/runs/hifigan
-python scripts/export_full_onnx.py --ckpt student/runs/vocos/best.pt --out-dir export/vits-melo-tts-zh_en-8k
+student/        MeloTTS 8k vocoders, losses, dataset, training, audio framing
+matcha8k/       Matcha 8k vocoder, frontend, ASR gate, accent experiments (lora_dec, dump_tf_mels)
+scripts/        teacher dump, corpus gen, ONNX export, bench, eval, G.711, TW lexicon
+docs/           ENV_SETUP, *_CONFIG, ORT_COMPAT, INTEGRATION, DEVICE_ACCEPTANCE, ZH_TW_PLAN, TW_ACCENT_RESEARCH
+data/           code-mixed corpus + TW reading overrides (rendered audio is gitignored — regenerate via scripts)
 ```
 
 ## GPU offload (moved out)
-The ggml-CUDA offload work — running flow+dec on the Jetson Nano's Maxwell GPU so TTS uses
-≤1 CPU thread during a live call — has moved to its own repo:
-**https://github.com/vieenrose/edge-speech-gpu-bench**. This repo stays focused on the
-CPU-only distillation + drop-in ONNX.
+The ggml-CUDA Maxwell-GPU offload work lives in its own repo:
+**https://github.com/vieenrose/edge-speech-gpu-bench**.
 
 ## License
-Code: MIT. Derives from MeloTTS (MIT, MyShell.ai) and references the sherpa-onnx (k2-fsa, Apache-2.0)
-melo export script. Attribution retained in `third_party/`.
+Code: MIT. Derives from MeloTTS (MIT, MyShell.ai), Matcha-TTS (MIT) / csukuangfj/dengcunqin matcha
+zh-en, references sherpa-onnx (k2-fsa, Apache-2.0). Vocoder arch inspired by Vocos (MIT). Attribution
+retained in `third_party/`.
