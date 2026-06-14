@@ -29,3 +29,6 @@ third_party/MeloTTS/
 
 # OS
 .DS_Store
+
+# Matcha 8k working data (models, mels, eval wavs — local/HF only)
+matcha_eval/
