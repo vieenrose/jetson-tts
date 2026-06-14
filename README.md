@@ -52,39 +52,6 @@ A clean way to *generate* TW-accented code-mixed audio offline (e.g. as a teache
 voice-cloning** an edge-tts zh-TW reference produced excellent results — but only as an offline data
 generator, not an edge-deployable model.
 
-### Accent Vector A/B samples (α=0.7 = chosen checkpoint)
-
-θ = θ_base + α·(θ_ft − θ_base). α=0.7 gives best trade-off: CER 0.496, EN recall 0.915.
-
-| α | CER | EN recall |
-|---|-----|-----------|
-| 0 (base) | 0.409 | 0.733 |
-| 0.5 | 0.478 | 0.733 |
-| **0.7** | **0.496** | **0.915** |
-| 1.0 | 1.000 | 0.415 |
-
-| # | type | text | base (α=0) | α=0.5 | α=0.7 |
-|---|------|------|------------|-------|-------|
-| 01 | zh | 您好,這個星期的研究進度,請您過目一下。 | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_vec_ab/zh_01_base.wav"></audio> | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_vec_ab/zh_01_a0.5.wav"></audio> | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_vec_ab/zh_01_a0.7.wav"></audio> |
-| 02 | zh | 記得攜帶證件,這是基本常識,謝謝您的配合。 | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_vec_ab/zh_02_base.wav"></audio> | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_vec_ab/zh_02_a0.5.wav"></audio> | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_vec_ab/zh_02_a0.7.wav"></audio> |
-| 03 | mix | 幫您轉接給 Kevin 陳經理,他的分機是二一八。 | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_vec_ab/mix_01_base.wav"></audio> | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_vec_ab/mix_01_a0.5.wav"></audio> | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_vec_ab/mix_01_a0.7.wav"></audio> |
-| 04 | mix | 這款 iPhone 支援 Wi-Fi,品質非常好,目前很受歡迎。 | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_vec_ab/mix_02_base.wav"></audio> | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_vec_ab/mix_02_a0.5.wav"></audio> | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_vec_ab/mix_02_a0.7.wav"></audio> |
-| 05 | mix | Amy 林正在開會,您的 email 已經 reset,請查收。 | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_vec_ab/mix_03_base.wav"></audio> | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_vec_ab/mix_03_a0.5.wav"></audio> | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_vec_ab/mix_03_a0.7.wav"></audio> |
-| 06 | en | Please hold, let me check your VIP membership. | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_vec_ab/en_01_base.wav"></audio> | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_vec_ab/en_01_a0.5.wav"></audio> | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_vec_ab/en_01_a0.7.wav"></audio> |
-| 07 | en | Hello, thank you for calling. How may I help you today? | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_vec_ab/en_02_base.wav"></audio> | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_vec_ab/en_02_a0.5.wav"></audio> | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_vec_ab/en_02_a0.7.wav"></audio> |
-
-### Previous v2 accent A/B (full fine-tune, for reference)
-
-| # | type | text | accent v2 | readings | teacher (Qwen) |
-|---|------|------|-----------|----------|----------------|
-| 01 | zh | 您好,這個星期的研究進度,請您過目一下。 | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_ab/01_zh_accent.wav"></audio> | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_ab/01_zh_readings.wav"></audio> | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_ab/01_zh_teacher.wav"></audio> |
-| 02 | zh | 記得攜帶證件,這是基本常識,謝謝您的配合。 | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_ab/02_zh_accent.wav"></audio> | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_ab/02_zh_readings.wav"></audio> | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_ab/02_zh_teacher.wav"></audio> |
-| 03 | mix | 幫您轉接給 Kevin 陳經理,他的分機是二一八。 | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_ab/03_mix_accent.wav"></audio> | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_ab/03_mix_readings.wav"></audio> | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_ab/03_mix_teacher.wav"></audio> |
-| 04 | mix | 這款 iPhone 支援 Wi-Fi,品質非常好,目前很受歡迎。 | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_ab/04_mix_accent.wav"></audio> | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_ab/04_mix_readings.wav"></audio> | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_ab/04_mix_teacher.wav"></audio> |
-| 05 | mix | Amy 林正在開會,您的 email 已經 reset,請查收。 | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_ab/05_mix_accent.wav"></audio> | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_ab/05_mix_readings.wav"></audio> | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_ab/05_mix_teacher.wav"></audio> |
-| 06 | en | Please hold, let me check your VIP membership. | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_ab/06_en_accent.wav"></audio> | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_ab/06_en_readings.wav"></audio> | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_ab/06_en_teacher.wav"></audio> |
-| 07 | mix | 中英文合成測試。It supports both English 和中文合成。 | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_ab/07_mix_accent.wav"></audio> | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_ab/07_mix_readings.wav"></audio> | <audio controls src="https://huggingface.co/datasets/Luigi/zh-en-tts-8k-comparison/resolve/main/accent_ab/07_mix_teacher.wav"></audio> |
-
 ## Evaluation tooling
 - Host x86 ORT-CPU RTF @1/2/4 threads + per-node profile (`scripts/bench_*.py`).
 - PESQ-NB + MCD-DTW vs teacher, simulated G.711 μ-law channel (`scripts/eval_quality.py`, `scripts/g711.py`).
