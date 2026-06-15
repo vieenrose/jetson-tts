@@ -70,3 +70,13 @@ than Matcha, and 8 kHz fidelity ceiling is ~PESQ 2.9 (telephony-fine; melo-8k is
 ## Decision gate
 Run only if (a) the Matcha joint co-training (task #19) does **not** clear the bar, or (b) user wants the
 melo variant regardless. Melo = easier/cleaner path, lower zh/en ceiling; Matcha-joint = higher ceiling, harder.
+
+## Progress log
+- **Phase 0 DONE (2026-06-15):** melo training env de-risked. Base = `MeloTTS-Chinese/checkpoint.pth`
+  (G-only, 256-spk, 44.1k, spk2id ZH:1). Fixes (see `scripts/melo_train_compat.patch`): merge full
+  train/data hyperparams into the stripped inference config; patch dead-S3 `load_pretrain_model` (pass
+  `--pretrain_G` explicitly, D/dur fresh); patch matplotlib `tostring_rgb`->`buffer_rgba`. Smoke: trained
+  22+ epochs on 200 clips, saved G/D/DUR_200.pth, sane losses [disc 2.9, gen 1.5, mel 14, kl 2.0].
+  Data prep = `scripts/melo_prep_corpus.py` (resample 44.1k + metadata) -> melo `preprocess_text.py` g2p.
+- **NEXT — Phase 1 g2p robustness:** code-mix g2p drops ~70% of lines (phone numbers/punct/English).
+  Must fix melo Chinese g2p (`text/chinese_mix.py`) or pre-normalize metadata before the full preprocess.

@@ -44,3 +44,9 @@ student/runs/
 # cloned third-party source (clone per docs/ENV_SETUP; matcha8k plan)
 third_party/BreezyVoice/
 third_party/Matcha-TTS/
+
+# melo fine-tune (audio + checkpoints reproducible)
+melo_ft/wav44/
+melo_ft/run/
+melo_ft/*.list
+melo_ft/*.list.cleaned
