@@ -5,6 +5,12 @@ Distill best-in-class open-source **Chinese/English code-mixed** TTS models into
 Nano gen1 CPU** (4× Cortex-A57). Target: a phone attendant whose audio leaves through an 8 kHz G.711
 channel — rendering 44.1/16 kHz wastes most of the vocoder compute.
 
+## 🚀 Live demo
+Try all three 8 kHz models in the browser — pick a backend, type zh/en code-mixed text, hear it
+stream: **[Sherpa-TTS Space](https://huggingface.co/spaces/Luigi/sherpa-zh-en-tts)**. The `📞`
+backends (MeloTTS-8k, Matcha-8k, Matcha-zh-TW-8k) are the drop-in models from this repo; the demo
+also keeps the original dual-engine (aishell3/Breeze2 + Silero) and 44.1 kHz MeloTTS backends for A/B.
+
 ## Released models (Hugging Face)
 | model | what it is | status |
 |---|---|---|
