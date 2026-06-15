@@ -40,13 +40,20 @@ debug frontend; vocoder trained on real (mel, 8 kHz) pairs. PESQ-NB 3.80.
 - **Readings (字音) — ✅ shipped.** A curated CN→TW reading-override lexicon (`data/tw_readings/`,
   `scripts/apply_tw_lexicon.py`): 垃圾→lèsè, 期→qí, 究→jiù, 質→zhí, 危→wéi, 企→qì… On-device lexicon
   swap only, no retrain, keeps English/code-mixing. Validated. → `Luigi/matcha-zh-tw-en-8k`.
-- **Accent (腔調) — ✗ out of scope for this edge stack.** Authentic Taiwan accent (reduced retroflex,
-  TW prosody) requires changing the acoustic model. Extensive attempts (full fine-tune; LoRA on
-  encoder/duration/decoder-attention; teacher-forced-mel vocoder co-training) could not reach clean
-  quality: changing the accent breaks the base acoustic↔vocoder co-training, and re-pairing on
-  flow-matching mels caps quality (PESQ ~1.2). Heavy LLM-TTS teachers (BreezyVoice/CosyVoice,
-  Qwen3-TTS) do accent+quality natively but are far too large for the Nano. It's a device-capability
-  limit, not a tuning bug. See `docs/TW_ACCENT_RESEARCH.md` and `docs/ZH_TW_PLAN.md`.
+- **Accent (腔調) — ✗ out of scope for this edge stack (thoroughly tested).** Authentic Taiwan accent
+  (reduced retroflex, TW prosody) requires fine-tuning the acoustic model on TW-accented audio. Every
+  approach tried — across **both** architectures — destroyed zh/en correctness (ASR-measured) while
+  creating the accent:
+  - **Matcha:** full fine-tune (zh CER 0.38→0.55, dropped words); LoRA on encoder/duration/decoder-attn
+    (garbled); teacher-forced-mel vocoder co-training and joint acoustic+vocoder co-training (CER 0.9+).
+  - **MeloTTS** (end-to-end VITS, no vocoder coupling): full FT, frozen-text-encoder, and low-LR +
+    discriminator-warmup all collapsed content to babble (CER 0.7–0.99, English recall ~0) vs base 0.357/0.59.
+  - **Root cause:** the only available TW-accent teacher is a *different-speaker* clone (Qwen3-TTS +
+    edge-tts ref). Forcing a lightweight single-speaker model to that voice drags its flow/decoder off the
+    content manifold regardless of LR, freezing, or warmup. It's a **data problem** (need TW-accent audio in
+    the base model's own voice, or real recorded zh-TW), not a tuning knob — and heavy LLM-TTS teachers that
+    do accent+quality natively are far too large for the Nano. Full ASR-gated logs in the memory plan;
+    see `docs/TW_ACCENT_RESEARCH.md`, `docs/ZH_TW_PLAN.md`, `docs/MELO_TW_ACCENT_PLAN.md`.
 
 A clean way to *generate* TW-accented code-mixed audio offline (e.g. as a teacher): **Qwen3-TTS-Base
 voice-cloning** an edge-tts zh-TW reference produced excellent results — but only as an offline data
