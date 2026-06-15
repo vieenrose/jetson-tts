@@ -146,7 +146,9 @@ def main():
         s0 = int(torch.randint(0, Tfull - seg + 1, (1,)).item())
         melc = mel[:, :, s0:s0 + seg]
         wc = W[:, s0 * HOP8:(s0 + seg) * HOP8]
-        audio = G(melc * ms + mm).squeeze(1)                          # [B,seg*HOP8]
+        # DECOUPLED: decoder is trained ONLY by the CFM loss (content-preserving); the vocoder co-adapts
+        # to the decoder's live mels but its audio/GAN loss must NOT flow into the decoder (corrupts content).
+        audio = G((melc * ms + mm).detach()).squeeze(1)              # [B,seg*HOP8]
         n = min(audio.shape[-1], wc.shape[-1]); audio, w = audio[..., :n], wc[..., :n]
         gan_on = step >= args.warmup
         if gan_on:
