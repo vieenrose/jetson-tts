@@ -103,6 +103,7 @@ def main():
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--save-every", type=int, default=2000)
     ap.add_argument("--log-every", type=int, default=100)
+    ap.add_argument("--l2-base", type=float, default=0.0, help="L2-to-base anchoring weight (anti-forgetting, EWC-lite)")
     ap.add_argument("--freeze-encoder", action="store_true",
                     help="freeze encoder + duration predictor + embeddings, train decoder only (zh-TW accent recipe, arXiv 2305.11320)")
     args = ap.parse_args()
@@ -133,6 +134,10 @@ def main():
     dl = torch.utils.data.DataLoader(ds, batch_size=args.batch, shuffle=True, num_workers=args.workers,
                                      collate_fn=collate, drop_last=True, persistent_workers=args.workers > 0)
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr, betas=(0.9, 0.98))
+    base_params = None
+    if args.l2_base > 0:
+        base_params = {n: p.detach().clone() for n, p in model.named_parameters() if p.requires_grad}
+        print(f"L2-to-base anchoring on {len(base_params)} params, lambda={args.l2_base}")
     step = 0; it = iter(dl); import time; t0 = time.time()
     while step < args.steps:
         try: X, xl, Y, yl = next(it)
@@ -140,6 +145,9 @@ def main():
         X, xl, Y, yl = X.to(dev), xl.to(dev), Y.to(dev), yl.to(dev)
         dur, prior, diff, _ = model(x=X, x_lengths=xl, y=Y, y_lengths=yl, spks=None, out_size=128)
         loss = dur + prior + diff
+        if base_params is not None:
+            l2 = sum(((p - base_params[n]) ** 2).sum() for n, p in model.named_parameters() if n in base_params)
+            loss = loss + args.l2_base * l2
         opt.zero_grad(set_to_none=True); loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0); opt.step(); step += 1
         if step % args.log_every == 0:
