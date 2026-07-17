@@ -1,0 +1,2 @@
+dbcb9e28bcc544675ef75a8ba12528bf09e713eb53a8c0c819dec3daf2d486d3  third_party/VibeVoice/demo/voices/zh-Xinran_woman.wav
+4f24bb0f0d76177752f14a9030321cd46bd6b5a79f9423ec8e47cd59dcc2adc7  mossnano/zhtw8k/vibe_gen_corpus.py

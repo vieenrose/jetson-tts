@@ -1,5 +1,5 @@
 """Prepare the TW corpus for MeloTTS fine-tuning: resample to 44.1 kHz + write metadata.list
-(path|ZH|ZH|text). Then run melo's preprocess_text.py for g2p -> train.list/val.list.
+(path|ZH|ZH_MIX_EN|text). Then run melo's preprocess_text.py for g2p -> train.list/val.list.
 
   python scripts/melo_prep_corpus.py --corpus matcha_eval/tw_qwen_corpus --out melo_ft --limit 0
   cd third_party/MeloTTS/melo && python preprocess_text.py \
@@ -32,7 +32,7 @@ def main():
         w44 = librosa.resample(w, orig_sr=sr, target_sr=44100, res_type="soxr_hq") if sr != 44100 else w
         p = os.path.abspath(os.path.join(args.out, "wav44", f"{r['id']}.wav"))
         sf.write(p, np.clip(w44, -1, 1), 44100)
-        out.write(f"{p}|ZH|ZH|{r['text'].strip()}\n"); n += 1
+        out.write(f"{p}|ZH|ZH_MIX_EN|{r['text'].strip()}\n"); n += 1
         if n % 1000 == 0: out.flush(); print(f"  {n}", flush=True)
     out.close()
     print(f"wrote {n} clips @44.1k -> {args.out}/metadata.list")

@@ -11,6 +11,35 @@ stream: **[Sherpa-TTS Space](https://huggingface.co/spaces/Luigi/sherpa-zh-en-tt
 backends (MeloTTS-8k, Matcha-8k, Matcha-zh-TW-8k) are the drop-in models from this repo; the demo
 also keeps the original dual-engine (aishell3/Breeze2 + Silero) and 44.1 kHz MeloTTS backends for A/B.
 
+## ⭐ PrimeTTS — tiny bilingual zh-TW + English (4.63M, 8 kHz, CPU)
+
+**[PrimeTTS demo →](https://huggingface.co/spaces/Luigi/PrimeTTS-app)** ·
+**[model + full training recipe →](https://huggingface.co/Luigi/PrimeTTS)** ·
+base arch: [`owensong/Inflect-Nano-v1`](https://huggingface.co/owensong/Inflect-Nano-v1)
+
+> **Streaming variant (PrimeTTS v2.1, MB-iSTFT-VITS):** the causal cached-conv vocoder +
+> token-streaming encoder for intra-phrase incremental output on the Nano. Trained weights/exports
+> are on the Hub (`Luigi/PrimeTTS`: `v21_streaming/`, `v2stream_streaming/`); the **full self-contained
+> reproduction recipe** (training-code patch, launch scripts, configs, frontend, arch spec) is in
+> [`reproduce/primetts-v21-streaming/`](reproduce/primetts-v21-streaming/README.md). Streaming
+> inference reference: [`streaming/`](streaming/). Design: [`docs/streaming-arch-design.md`](docs/streaming-arch-design.md).
+
+A third, from-scratch-distilled track: **PrimeTTS** packs Mandarin (Taiwan) **and** English into the
+**frozen 4.63M-parameter Inflect-Nano** architecture (depthwise Conv-FFN, no attention; ~3.47M acoustic
++ ~1.17M Snake-HiFiGAN vocoder), emitting **8 kHz** and running torch-free on CPU via `onnxruntime`.
+One model, one voice — zh-TW, English, and code-mix through a single unified bopomofo+arpabet frontend.
+
+The result that matters: **held-out Mandarin CER fell from ~0.88 to ~0.06** at this size — proving the
+architecture was never capacity-limited. Two levers did it, both architecture-frozen:
+1. **Phone-level forced alignment** (espeak phoneme-CTC + `torchaudio.forced_align`) replacing crude
+   char/letter-CTC splits — the prior "capacity wall" was mis-aligned training targets.
+2. **Diverse, well-covered training text** (per-language) — the narrow original corpus left most
+   characters/words unseen at eval time.
+
+Applied symmetrically to English, the same recipe yields a genuinely **bilingual** model
+(zh-only ≈ 0.13, English ≈ 0.16 in one 4.63M net). Teacher: BreezyVoice (single "mark" voice);
+eval: offline X-ASR (sherpa zipformer zh-en). Lives in `mossnano/zhtw8k/`.
+
 ## Released models (Hugging Face)
 | model | what it is | status |
 |---|---|---|

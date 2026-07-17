@@ -1,0 +1,1026 @@
+diff --git a/attentions.py b/attentions.py
+index 4e0b0c1..395652f 100644
+--- a/attentions.py
++++ b/attentions.py
+@@ -5,10 +5,19 @@ import torch
+ from torch import nn
+ from torch.nn import functional as F
+ 
++import os
+ import commons
+ import modules
+ from modules import LayerNorm
+-   
++
++# Phase-3 streaming encoder (env-gated). When MBVITS_STREAM_ENC=1 the text encoder uses
++# a band self-attention mask (full left history + a small right lookahead) and causal
++# FFN convs, so each token depends only on past tokens + LOOKAHEAD future tokens -> the
++# encoder can run incrementally with a bounded lookahead (token-level input streaming).
++_STREAM_ENC = os.environ.get("MBVITS_STREAM_ENC") == "1"
++_ENC_LOOKAHEAD = int(os.environ.get("MBVITS_ENC_LOOKAHEAD", "3"))
++_ENC_PAST = os.environ.get("MBVITS_ENC_PAST")  # None => unlimited left history
++
+ 
+ class Encoder(nn.Module):
+   def __init__(self, hidden_channels, filter_channels, n_heads, n_layers, kernel_size=1, p_dropout=0., window_size=4, **kwargs):
+@@ -21,6 +30,10 @@ class Encoder(nn.Module):
+     self.p_dropout = p_dropout
+     self.window_size = window_size
+ 
++    self.stream = _STREAM_ENC
++    self.lookahead = _ENC_LOOKAHEAD
++    self.past = int(_ENC_PAST) if _ENC_PAST is not None else None
++
+     self.drop = nn.Dropout(p_dropout)
+     self.attn_layers = nn.ModuleList()
+     self.norm_layers_1 = nn.ModuleList()
+@@ -29,11 +42,27 @@ class Encoder(nn.Module):
+     for i in range(self.n_layers):
+       self.attn_layers.append(MultiHeadAttention(hidden_channels, hidden_channels, n_heads, p_dropout=p_dropout, window_size=window_size))
+       self.norm_layers_1.append(LayerNorm(hidden_channels))
+-      self.ffn_layers.append(FFN(hidden_channels, hidden_channels, filter_channels, kernel_size, p_dropout=p_dropout))
++      # streaming: causal FFN (left-pad only) so no per-layer future leak; lookahead is
++      # then bounded purely by the attention band.
++      self.ffn_layers.append(FFN(hidden_channels, hidden_channels, filter_channels, kernel_size, p_dropout=p_dropout, causal=self.stream))
+       self.norm_layers_2.append(LayerNorm(hidden_channels))
+ 
++  def _band_mask(self, attn_mask):
++    # attn_mask: [B,1,T,T]. Keep key j for query i iff (j-i)<=lookahead and (i-j)<=past.
++    # Derive positions via cumsum(ones) along the real T axis so the trace stays
++    # DYNAMIC in T (torch.arange(shape[-1]) bakes a constant under onnx tracing).
++    ones = torch.ones_like(attn_mask[0, 0, 0, :])                 # [T]
++    idx = torch.cumsum(ones, dim=0) - 1.0                         # [0,1,...,T-1], follows dynamic T
++    rel = idx[None, :] - idx[:, None]                             # [T,T], rel = j - i
++    band = (rel <= float(self.lookahead))                        # limit future context
++    if self.past is not None:
++      band = band & (rel >= -float(self.past))                   # limit history
++    return attn_mask * band[None, None].to(attn_mask.dtype)
++
+   def forward(self, x, x_mask):
+     attn_mask = x_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
++    if self.stream:
++      attn_mask = self._band_mask(attn_mask)
+     x = x * x_mask
+     for i in range(self.n_layers):
+       y = self.attn_layers[i](x, x, attn_mask)
+diff --git a/data_utils.py b/data_utils.py
+index 4855699..c48932d 100644
+--- a/data_utils.py
++++ b/data_utils.py
+@@ -390,3 +390,132 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
+ 
+     def __len__(self):
+         return self.num_samples // self.batch_size
++
++
++# ============================================================================
++# Custom (phone, tone, lang) JSONL reader for the zh-TW/en MB-iSTFT-VITS build.
++# Each jsonl row: {phone_ids, tone_ids, lang_ids, hifigan_durations,
++#                  target_audio, text, speaker_id}. cleaned_text=True: ids are
++# fed directly (NO espeak / text-cleaner). Audio (48k) is resampled to the
++# config sampling_rate on load; linear spectrogram at filter/hop/win.
++# ============================================================================
++import json
++import soundfile as sf
++import librosa
++
++
++class JsonlTextAudioLoader(torch.utils.data.Dataset):
++    def __init__(self, jsonl_path, hparams):
++        self.sampling_rate = hparams.sampling_rate
++        self.filter_length = hparams.filter_length
++        self.hop_length    = hparams.hop_length
++        self.win_length    = hparams.win_length
++        self.min_phone_len = getattr(hparams, "min_phone_len", 4)
++        self.max_phone_len = getattr(hparams, "max_phone_len", 400)
++        self.max_wav_sec   = getattr(hparams, "max_wav_sec", 15.0)
++        self.add_blank     = getattr(hparams, "add_blank", False)
++
++        rows = []
++        with open(jsonl_path, encoding="utf-8") as f:
++            for line in f:
++                line = line.strip()
++                if line:
++                    rows.append(json.loads(line))
++        self.rows = self._filter(rows)
++        # spec lengths (for optional bucketing) ~ resampled_wav_len / hop
++        self.lengths = [r["_spec_len_est"] for r in self.rows]
++        random.seed(1234)
++        random.shuffle(self.rows)
++
++    def _filter(self, rows):
++        kept = []
++        for r in rows:
++            n = len(r["phone_ids"])
++            if not (self.min_phone_len <= n <= self.max_phone_len):
++                continue
++            if not (len(r["tone_ids"]) == n and len(r["lang_ids"]) == n):
++                continue
++            try:
++                info = sf.info(r["target_audio"])
++            except Exception:
++                continue
++            secs = info.frames / info.samplerate
++            if secs > self.max_wav_sec:
++                continue
++            r["_spec_len_est"] = int(secs * self.sampling_rate) // self.hop_length
++            kept.append(r)
++        return kept
++
++    def get_audio(self, filename):
++        audio, sr = sf.read(filename, dtype="float32", always_2d=False)
++        if audio.ndim > 1:
++            audio = audio.mean(axis=1)
++        if sr != self.sampling_rate:
++            audio = librosa.resample(audio, orig_sr=sr, target_sr=self.sampling_rate)
++        audio_norm = torch.FloatTensor(audio).clamp_(-1.0, 1.0).unsqueeze(0)  # [1, T], in [-1,1]
++        spec = spectrogram_torch(audio_norm, self.filter_length, self.sampling_rate,
++                                 self.hop_length, self.win_length, center=False)
++        spec = torch.squeeze(spec, 0)  # [freq, Tspec]
++        return spec, audio_norm
++
++    def __getitem__(self, index):
++        r = self.rows[index]
++        p, t, l = r["phone_ids"], r["tone_ids"], r["lang_ids"]
++        if self.add_blank:
++            # MeloTTS/VITS pattern: interleave blank id 0 on all 3 streams
++            p = commons.intersperse(p, 0)
++            t = commons.intersperse(t, 0)
++            l = commons.intersperse(l, 0)
++        phone = torch.LongTensor(p)
++        tone  = torch.LongTensor(t)
++        lang  = torch.LongTensor(l)
++        spec, wav = self.get_audio(r["target_audio"])
++        sid = int(r.get("speaker_id", 0))  # 0 for single-speaker corpora (v2/A24)
++        return (phone, tone, lang, spec, wav, sid)
++
++    def __len__(self):
++        return len(self.rows)
++
++
++class JsonlTextAudioCollate:
++    """Zero-pad (phone, tone, lang, spec, wav); sort by spec length descending."""
++    def __init__(self, return_ids=False):
++        self.return_ids = return_ids
++
++    def __call__(self, batch):
++        _, ids_sorted = torch.sort(
++            torch.LongTensor([x[3].size(1) for x in batch]), dim=0, descending=True)
++
++        max_text = max(x[0].size(0) for x in batch)
++        max_spec = max(x[3].size(1) for x in batch)
++        max_wav  = max(x[4].size(1) for x in batch)
++        n = len(batch)
++
++        text_lengths = torch.LongTensor(n)
++        spec_lengths = torch.LongTensor(n)
++        wav_lengths  = torch.LongTensor(n)
++
++        phone_padded = torch.zeros(n, max_text, dtype=torch.long)
++        tone_padded  = torch.zeros(n, max_text, dtype=torch.long)
++        lang_padded  = torch.zeros(n, max_text, dtype=torch.long)
++        spec_padded  = torch.zeros(n, batch[0][3].size(0), max_spec)
++        wav_padded   = torch.zeros(n, 1, max_wav)
++        sid          = torch.zeros(n, dtype=torch.long)
++
++        for i in range(len(ids_sorted)):
++            phone, tone, lang, spec, wav, s = batch[ids_sorted[i]]
++            phone_padded[i, :phone.size(0)] = phone
++            tone_padded[i,  :tone.size(0)]  = tone
++            lang_padded[i,  :lang.size(0)]  = lang
++            text_lengths[i] = phone.size(0)
++            spec_padded[i, :, :spec.size(1)] = spec
++            spec_lengths[i] = spec.size(1)
++            wav_padded[i, :, :wav.size(1)] = wav
++            wav_lengths[i] = wav.size(1)
++            sid[i] = s
++
++        out = (phone_padded, tone_padded, lang_padded, text_lengths,
++               spec_padded, spec_lengths, wav_padded, wav_lengths, sid)
++        if self.return_ids:
++            return out + (ids_sorted,)
++        return out
+diff --git a/mel_processing.py b/mel_processing.py
+index 817f037..89396ec 100644
+--- a/mel_processing.py
++++ b/mel_processing.py
+@@ -64,7 +64,8 @@ def spectrogram_torch(y, n_fft, sampling_rate, hop_size, win_size, center=False)
+     y = y.squeeze(1)
+ 
+     spec = torch.stft(y, n_fft, hop_length=hop_size, win_length=win_size, window=hann_window[wnsize_dtype_device],
+-                      center=center, pad_mode='reflect', normalized=False, onesided=True)
++                      center=center, pad_mode='reflect', normalized=False, onesided=True, return_complex=True)
++    spec = torch.view_as_real(spec)  # torch>=2.0: stft returns complex; back to [..., 2]
+ 
+     spec = torch.sqrt(spec.pow(2).sum(-1) + 1e-6)
+     return spec
+@@ -75,7 +76,7 @@ def spec_to_mel_torch(spec, n_fft, num_mels, sampling_rate, fmin, fmax):
+     dtype_device = str(spec.dtype) + '_' + str(spec.device)
+     fmax_dtype_device = str(fmax) + '_' + dtype_device
+     if fmax_dtype_device not in mel_basis:
+-        mel = librosa_mel_fn(sampling_rate, n_fft, num_mels, fmin, fmax)
++        mel = librosa_mel_fn(sr=sampling_rate, n_fft=n_fft, n_mels=num_mels, fmin=fmin, fmax=fmax)
+         mel_basis[fmax_dtype_device] = torch.from_numpy(mel).to(dtype=spec.dtype, device=spec.device)
+     spec = torch.matmul(mel_basis[fmax_dtype_device], spec)
+     spec = spectral_normalize_torch(spec)
+@@ -93,7 +94,7 @@ def mel_spectrogram_torch(y, n_fft, num_mels, sampling_rate, hop_size, win_size,
+     fmax_dtype_device = str(fmax) + '_' + dtype_device
+     wnsize_dtype_device = str(win_size) + '_' + dtype_device
+     if fmax_dtype_device not in mel_basis:
+-        mel = librosa_mel_fn(sampling_rate, n_fft, num_mels, fmin, fmax)
++        mel = librosa_mel_fn(sr=sampling_rate, n_fft=n_fft, n_mels=num_mels, fmin=fmin, fmax=fmax)
+         mel_basis[fmax_dtype_device] = torch.from_numpy(mel).to(dtype=y.dtype, device=y.device)
+     if wnsize_dtype_device not in hann_window:
+         hann_window[wnsize_dtype_device] = torch.hann_window(win_size).to(dtype=y.dtype, device=y.device)
+@@ -102,7 +103,8 @@ def mel_spectrogram_torch(y, n_fft, num_mels, sampling_rate, hop_size, win_size,
+     y = y.squeeze(1)
+ 
+     spec = torch.stft(y, n_fft, hop_length=hop_size, win_length=win_size, window=hann_window[wnsize_dtype_device],
+-                      center=center, pad_mode='reflect', normalized=False, onesided=True)
++                      center=center, pad_mode='reflect', normalized=False, onesided=True, return_complex=True)
++    spec = torch.view_as_real(spec)  # torch>=2.0: stft returns complex; back to [..., 2]
+ 
+     spec = torch.sqrt(spec.pow(2).sum(-1) + 1e-6)
+ 
+diff --git a/models.py b/models.py
+index 5115ec4..b91a34f 100644
+--- a/models.py
++++ b/models.py
+@@ -144,9 +144,13 @@ class TextEncoder(nn.Module):
+       n_heads,
+       n_layers,
+       kernel_size,
+-      p_dropout):
++      p_dropout,
++      num_tones=6,
++      num_langs=2):
+     super().__init__()
+     self.n_vocab = n_vocab
++    self.num_tones = num_tones
++    self.num_langs = num_langs
+     self.out_channels = out_channels
+     self.hidden_channels = hidden_channels
+     self.filter_channels = filter_channels
+@@ -155,8 +159,13 @@ class TextEncoder(nn.Module):
+     self.kernel_size = kernel_size
+     self.p_dropout = p_dropout
+ 
+-    self.emb = nn.Embedding(n_vocab, hidden_channels)
+-    nn.init.normal_(self.emb.weight, 0.0, hidden_channels**-0.5)
++    # (phone, tone, lang) frontend (MeloTTS pattern; bert/ja_bert dropped)
++    self.emb_phone = nn.Embedding(n_vocab, hidden_channels)
++    nn.init.normal_(self.emb_phone.weight, 0.0, hidden_channels**-0.5)
++    self.emb_tone = nn.Embedding(num_tones, hidden_channels)
++    nn.init.normal_(self.emb_tone.weight, 0.0, hidden_channels**-0.5)
++    self.emb_lang = nn.Embedding(num_langs, hidden_channels)
++    nn.init.normal_(self.emb_lang.weight, 0.0, hidden_channels**-0.5)
+ 
+     self.encoder = attentions.Encoder(
+       hidden_channels,
+@@ -167,8 +176,9 @@ class TextEncoder(nn.Module):
+       p_dropout)
+     self.proj= nn.Conv1d(hidden_channels, out_channels * 2, 1)
+ 
+-  def forward(self, x, x_lengths):
+-    x = self.emb(x) * math.sqrt(self.hidden_channels) # [b, t, h]
++  def forward(self, x, tone, lang, x_lengths):
++    x = (self.emb_phone(x) + self.emb_tone(tone) + self.emb_lang(lang)) \
++        * math.sqrt(self.hidden_channels) # [b, t, h]
+     x = torch.transpose(x, 1, -1) # [b, h, t]
+     x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1).to(x.dtype)
+ 
+@@ -594,6 +604,8 @@ class SynthesizerTrn(nn.Module):
+     mb_istft_vits = False,
+     subbands = False,
+     istft_vits=False,
++    num_tones=6,
++    num_langs=2,
+     **kwargs):
+ 
+     super().__init__()
+@@ -628,7 +640,9 @@ class SynthesizerTrn(nn.Module):
+         n_heads,
+         n_layers,
+         kernel_size,
+-        p_dropout)
++        p_dropout,
++        num_tones=num_tones,
++        num_langs=num_langs)
+     if mb_istft_vits == True:
+       print('Mutli-band iSTFT VITS')
+       self.dec = Multiband_iSTFT_Generator(inter_channels, resblock, resblock_kernel_sizes, resblock_dilation_sizes, upsample_rates, upsample_initial_channel, upsample_kernel_sizes, gen_istft_n_fft, gen_istft_hop_size, subbands, gin_channels=gin_channels)
+@@ -652,9 +666,9 @@ class SynthesizerTrn(nn.Module):
+     if n_speakers > 1:
+       self.emb_g = nn.Embedding(n_speakers, gin_channels)
+ 
+-  def forward(self, x, x_lengths, y, y_lengths, sid=None):
++  def forward(self, x, tone, lang, x_lengths, y, y_lengths, sid=None):
+ 
+-    x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths)
++    x, m_p, logs_p, x_mask = self.enc_p(x, tone, lang, x_lengths)
+     if self.n_speakers > 0:
+       g = self.emb_g(sid).unsqueeze(-1) # [b, h, 1]
+     else:
+@@ -692,19 +706,23 @@ class SynthesizerTrn(nn.Module):
+     o, o_mb = self.dec(z_slice, g=g)
+     return o, o_mb, l_length, attn, ids_slice, x_mask, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
+ 
+-  def infer(self, x, x_lengths, sid=None, noise_scale=1, length_scale=1, noise_scale_w=1., max_len=None):
+-    x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths)
++  def infer(self, x, tone, lang, x_lengths, sid=None, noise_scale=1, length_scale=1, noise_scale_w=1., max_len=None, durations=None):
++    x, m_p, logs_p, x_mask = self.enc_p(x, tone, lang, x_lengths)
+     if self.n_speakers > 0:
+       g = self.emb_g(sid).unsqueeze(-1) # [b, h, 1]
+     else:
+       g = None
+ 
+-    if self.use_sdp:
+-      logw = self.dp(x, x_mask, g=g, reverse=True, noise_scale=noise_scale_w)
++    if durations is not None:
++      # teacher-forced: use externally supplied per-phone frame counts [b, 1, t_x]
++      w_ceil = durations.to(x_mask.dtype) * x_mask
+     else:
+-      logw = self.dp(x, x_mask, g=g)
+-    w = torch.exp(logw) * x_mask * length_scale
+-    w_ceil = torch.ceil(w)
++      if self.use_sdp:
++        logw = self.dp(x, x_mask, g=g, reverse=True, noise_scale=noise_scale_w)
++      else:
++        logw = self.dp(x, x_mask, g=g)
++      w = torch.exp(logw) * x_mask * length_scale
++      w_ceil = torch.ceil(w)
+     y_lengths = torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).long()
+     y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, None), 1).to(x_mask.dtype)
+     attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
+diff --git a/pqmf.py b/pqmf.py
+index 63d5a2d..56adc1d 100644
+--- a/pqmf.py
++++ b/pqmf.py
+@@ -9,7 +9,7 @@ import numpy as np
+ import torch
+ import torch.nn.functional as F
+ 
+-from scipy.signal import kaiser
++from scipy.signal.windows import kaiser
+ 
+ 
+ def design_prototype_filter(taps=62, cutoff_ratio=0.15, beta=9.0):
+@@ -75,15 +75,15 @@ class PQMF(torch.nn.Module):
+                 (-1) ** k * np.pi / 4)
+ 
+         # convert to tensor
+-        analysis_filter = torch.from_numpy(h_analysis).float().unsqueeze(1).cuda(device)
+-        synthesis_filter = torch.from_numpy(h_synthesis).float().unsqueeze(0).cuda(device)
++        analysis_filter = torch.from_numpy(h_analysis).float().unsqueeze(1).to(device)
++        synthesis_filter = torch.from_numpy(h_synthesis).float().unsqueeze(0).to(device)
+ 
+         # register coefficients as beffer
+         self.register_buffer("analysis_filter", analysis_filter)
+         self.register_buffer("synthesis_filter", synthesis_filter)
+ 
+         # filter for downsampling & upsampling
+-        updown_filter = torch.zeros((subbands, subbands, subbands)).float().cuda(device)
++        updown_filter = torch.zeros((subbands, subbands, subbands)).float().to(device)
+         for k in range(subbands):
+             updown_filter[k, k, 0] = 1.0
+         self.register_buffer("updown_filter", updown_filter)
+diff --git a/stft_loss.py b/stft_loss.py
+index 08120d2..7810937 100644
+--- a/stft_loss.py
++++ b/stft_loss.py
+@@ -20,7 +20,8 @@ def stft(x, fft_size, hop_size, win_length, window):
+     Returns:
+         Tensor: Magnitude spectrogram (B, #frames, fft_size // 2 + 1).
+     """
+-    x_stft = torch.stft(x, fft_size, hop_size, win_length, window.to(x.device))
++    x_stft = torch.stft(x, fft_size, hop_size, win_length, window.to(x.device), return_complex=True)
++    x_stft = torch.view_as_real(x_stft)  # torch>=2.0: complex -> [..., 2]
+     real = x_stft[..., 0]
+     imag = x_stft[..., 1]
+ 
+diff --git a/train_latest.py b/train_latest.py
+index 1ea6799..d0d8da2 100644
+--- a/train_latest.py
++++ b/train_latest.py
+@@ -1,312 +1,325 @@
+-import os
+-import json
+-import argparse
+-import itertools
+-import math
++"""Phase 2 full 16kHz DDP trainer for the (phone,tone,lang) MB-iSTFT-VITS parity build.
++
++torchrun-launched (one process per GPU; reads LOCAL_RANK/RANK/WORLD_SIZE from env
++-- do NOT use mp.spawn under torchrun). Uses the Phase-1 JsonlTextAudioLoader +
++3-embedding SynthesizerTrn with MAS (monotonic_align.maximum_path) as PRIMARY
++duration source; the deterministic DurationPredictor trains on MAS-derived w.
++
++fp32 (no autocast): the MAS neg_cent path hits a bf16->numpy crash, so we run the
++proven fp32 loop from the 50-utt overfit. Full VITS objective:
++disc + gen(mel/kl/dur/fm/gen/subband).
++
++Launch:
++  CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --nproc_per_node=2 \
++      train_latest.py -c configs/zhtw_mb_istft_16k.json -m zhtw_mbistft_16k
++"""
++import os, sys, glob, time, math
+ import torch
+-from torch import nn, optim
+-from torch.nn import functional as F
++import torch.nn.functional as F
+ from torch.utils.data import DataLoader
+ from torch.utils.tensorboard import SummaryWriter
+-import torch.multiprocessing as mp
+ import torch.distributed as dist
+ from torch.nn.parallel import DistributedDataParallel as DDP
+-from torch.cuda.amp import autocast, GradScaler
+-from pqmf import PQMF
+ 
+ import commons
+ import utils
+-from data_utils import (
+-  TextAudioLoader,
+-  TextAudioCollate,
+-  DistributedBucketSampler
+-)
+-from models import (
+-  SynthesizerTrn,
+-  MultiPeriodDiscriminator,
+-)
+-from losses import (
+-  generator_loss,
+-  discriminator_loss,
+-  feature_loss,
+-  kl_loss,
+-  subband_stft_loss
+-)
++from data_utils import JsonlTextAudioLoader, JsonlTextAudioCollate, DistributedBucketSampler
++from models import SynthesizerTrn, MultiPeriodDiscriminator
++from losses import generator_loss, discriminator_loss, feature_loss, kl_loss, subband_stft_loss
+ from mel_processing import mel_spectrogram_torch, spec_to_mel_torch
+-from text.symbols import symbols
++from pqmf import PQMF
+ 
+-torch.autograd.set_detect_anomaly(True)
+ torch.backends.cudnn.benchmark = True
++VOCAB = 88               # phone vocab (ids 0..87); matches Phase-1 overfit/resynth/gate
+ global_step = 0
+ 
+ 
++def _prune_ckpts(model_dir, keep):
++    for tag in ("G", "D"):
++        fl = glob.glob(os.path.join(model_dir, f"{tag}_*.pth"))
++        fl.sort(key=lambda f: int("".join(filter(str.isdigit, os.path.basename(f)))))
++        for f in fl[:-keep]:
++            try:
++                os.remove(f)
++            except OSError:
++                pass
++
++
+ def main():
+-  """Assume Single Node Multi GPUs Training Only"""
+-  assert torch.cuda.is_available(), "CPU training is not allowed."
+-
+-  n_gpus = torch.cuda.device_count()
+-  os.environ['MASTER_ADDR'] = 'localhost'
+-  os.environ['MASTER_PORT'] = '65520'
+-#   n_gpus = 1
+-
+-  hps = utils.get_hparams()
+-  mp.spawn(run, nprocs=n_gpus, args=(n_gpus, hps,))
+-
+-
+-def run(rank, n_gpus, hps):
+-  global global_step
+-  if rank == 0:
+-    logger = utils.get_logger(hps.model_dir)
+-    logger.info(hps)
+-    utils.check_git_hash(hps.model_dir)
+-    writer = SummaryWriter(log_dir=hps.model_dir)
+-    writer_eval = SummaryWriter(log_dir=os.path.join(hps.model_dir, "eval"))
+-
+-  dist.init_process_group(backend='nccl', init_method='env://', world_size=n_gpus, rank=rank)
+-  torch.manual_seed(hps.train.seed)
+-  torch.cuda.set_device(rank)
+-
+-  train_dataset = TextAudioLoader(hps.data.training_files, hps.data)
+-  train_sampler = DistributedBucketSampler(
+-      train_dataset,
+-      hps.train.batch_size,
+-      [32,300,400,500,600,700,800,900,1000],
+-      num_replicas=n_gpus,
+-      rank=rank,
+-      shuffle=True)
+-  collate_fn = TextAudioCollate()
+-  train_loader = DataLoader(train_dataset, num_workers=8, shuffle=False, pin_memory=True,
+-      collate_fn=collate_fn, batch_sampler=train_sampler)
+-  if rank == 0:
+-    eval_dataset = TextAudioLoader(hps.data.validation_files, hps.data)
+-    eval_loader = DataLoader(eval_dataset, num_workers=1, shuffle=False,
+-        batch_size=hps.train.batch_size, pin_memory=True,
+-        drop_last=False, collate_fn=collate_fn)
+-
+-  net_g = SynthesizerTrn(
+-      len(symbols),
+-      hps.data.filter_length // 2 + 1,
+-      hps.train.segment_size // hps.data.hop_length,
+-      **hps.model).cuda(rank)
+-  net_d = MultiPeriodDiscriminator(hps.model.use_spectral_norm).cuda(rank)
+-  optim_g = torch.optim.AdamW(
+-      net_g.parameters(), 
+-      hps.train.learning_rate, 
+-      betas=hps.train.betas, 
+-      eps=hps.train.eps)
+-  optim_d = torch.optim.AdamW(
+-      net_d.parameters(),
+-      hps.train.learning_rate, 
+-      betas=hps.train.betas, 
+-      eps=hps.train.eps)
+-  net_g = DDP(net_g, device_ids=[rank])
+-  net_d = DDP(net_d, device_ids=[rank])
+-
+-  try:
+-    _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(hps.model_dir, "G_*.pth"), net_g, optim_g)
+-    _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(hps.model_dir, "D_*.pth"), net_d, optim_d)
+-    global_step = (epoch_str - 1) * len(train_loader)
+-  except:
+-    epoch_str = 1
+-    global_step = 0
+-
+-  scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=hps.train.lr_decay, last_epoch=epoch_str-2)
+-  scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optim_d, gamma=hps.train.lr_decay, last_epoch=epoch_str-2)
+-
+-  scaler = GradScaler(enabled=hps.train.fp16_run)
+-
+-  for epoch in range(epoch_str, hps.train.epochs + 1):
+-    if rank==0:
+-      train_and_evaluate(rank, epoch, hps, [net_g, net_d], [optim_g, optim_d], [scheduler_g, scheduler_d], scaler, [train_loader, eval_loader], logger, [writer, writer_eval])
+-    else:
+-      train_and_evaluate(rank, epoch, hps, [net_g, net_d], [optim_g, optim_d], [scheduler_g, scheduler_d], scaler, [train_loader, None], None, None)
+-    scheduler_g.step()
+-    scheduler_d.step()
+-
+-
+-
+-def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loaders, logger, writers):
+-  net_g, net_d = nets
+-  optim_g, optim_d = optims
+-  scheduler_g, scheduler_d = schedulers
+-  train_loader, eval_loader = loaders
+-  if writers is not None:
+-    writer, writer_eval = writers
+-
+-  train_loader.batch_sampler.set_epoch(epoch)
+-  global global_step
+-
+-  net_g.train()
+-  net_d.train()
+-  for batch_idx, (x, x_lengths, spec, spec_lengths, y, y_lengths) in enumerate(train_loader):
+-    x, x_lengths = x.cuda(rank, non_blocking=True), x_lengths.cuda(rank, non_blocking=True)
+-    spec, spec_lengths = spec.cuda(rank, non_blocking=True), spec_lengths.cuda(rank, non_blocking=True)
+-    y, y_lengths = y.cuda(rank, non_blocking=True), y_lengths.cuda(rank, non_blocking=True)
+-
+-    with autocast(enabled=hps.train.fp16_run):
+-      y_hat, y_hat_mb, l_length, attn, ids_slice, x_mask, z_mask,\
+-      (z, z_p, m_p, logs_p, m_q, logs_q) = net_g(x, x_lengths, spec, spec_lengths)
+-
+-      mel = spec_to_mel_torch(
+-          spec, 
+-          hps.data.filter_length, 
+-          hps.data.n_mel_channels, 
+-          hps.data.sampling_rate,
+-          hps.data.mel_fmin, 
+-          hps.data.mel_fmax)
+-      y_mel = commons.slice_segments(mel, ids_slice, hps.train.segment_size // hps.data.hop_length)
+-      y_hat_mel = mel_spectrogram_torch(
+-          y_hat.squeeze(1), 
+-          hps.data.filter_length, 
+-          hps.data.n_mel_channels, 
+-          hps.data.sampling_rate, 
+-          hps.data.hop_length, 
+-          hps.data.win_length, 
+-          hps.data.mel_fmin, 
+-          hps.data.mel_fmax
+-      )
+-
+-      y = commons.slice_segments(y, ids_slice * hps.data.hop_length, hps.train.segment_size) # slice 
+-
+-      # Discriminator
+-      y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
+-      with autocast(enabled=False):
+-        loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(y_d_hat_r, y_d_hat_g)
+-        loss_disc_all = loss_disc
+-    optim_d.zero_grad()
+-    scaler.scale(loss_disc_all).backward()
+-    scaler.unscale_(optim_d)
+-    grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
+-    scaler.step(optim_d)
+-
+-    
+-
+-
+-    with autocast(enabled=hps.train.fp16_run):
+-      # Generator
+-      y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
+-      with autocast(enabled=False):
+-        loss_dur = torch.sum(l_length.float())
+-        loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
+-        loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
+-
+-        loss_fm = feature_loss(fmap_r, fmap_g)
+-        loss_gen, losses_gen = generator_loss(y_d_hat_g)
+-        
+-        if hps.model.mb_istft_vits == True:
+-          pqmf = PQMF(y.device)
+-          y_mb = pqmf.analysis(y)
+-          loss_subband = subband_stft_loss(hps, y_mb, y_hat_mb)
+-        else:
+-          loss_subband = torch.tensor(0.0)
+-
+-        loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl + loss_subband
+-
+-    optim_g.zero_grad()
+-    scaler.scale(loss_gen_all).backward()
+-    scaler.unscale_(optim_g)
+-    grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
+-    scaler.step(optim_g)
+-    scaler.update()
+-
+-    if rank==0:
+-      if global_step % hps.train.log_interval == 0:
+-        lr = optim_g.param_groups[0]['lr']
+-        losses = [loss_disc, loss_gen, loss_fm, loss_mel, loss_dur, loss_kl, loss_subband]
+-        logger.info('Train Epoch: {} [{:.0f}%]'.format(
+-          epoch,
+-          100. * batch_idx / len(train_loader)))
+-        logger.info([x.item() for x in losses] + [global_step, lr])
+-        
+-        scalar_dict = {"loss/g/total": loss_gen_all, "loss/d/total": loss_disc_all, "learning_rate": lr, "grad_norm_d": grad_norm_d, "grad_norm_g": grad_norm_g}
+-        scalar_dict.update({"loss/g/fm": loss_fm, "loss/g/mel": loss_mel, "loss/g/dur": loss_dur, "loss/g/kl": loss_kl, "loss/g/subband": loss_subband})
+-
+-        scalar_dict.update({"loss/g/{}".format(i): v for i, v in enumerate(losses_gen)})
+-        scalar_dict.update({"loss/d_r/{}".format(i): v for i, v in enumerate(losses_disc_r)})
+-        scalar_dict.update({"loss/d_g/{}".format(i): v for i, v in enumerate(losses_disc_g)})
+-        image_dict = { 
+-            "slice/mel_org": utils.plot_spectrogram_to_numpy(y_mel[0].data.cpu().numpy()),
+-            "slice/mel_gen": utils.plot_spectrogram_to_numpy(y_hat_mel[0].data.cpu().numpy()), 
+-            "all/mel": utils.plot_spectrogram_to_numpy(mel[0].data.cpu().numpy()),
+-            "all/attn": utils.plot_alignment_to_numpy(attn[0,0].data.cpu().numpy())
+-        }
+-        utils.summarize(
+-          writer=writer,
+-          global_step=global_step, 
+-          images=image_dict,
+-          scalars=scalar_dict)
+-
+-      if global_step % hps.train.eval_interval == 0:
+-        evaluate(hps, net_g, eval_loader, writer_eval)
+-        utils.save_checkpoint(net_g, optim_g, hps.train.learning_rate, epoch, os.path.join(hps.model_dir, "G_{}.pth".format(global_step)))
+-        utils.save_checkpoint(net_d, optim_d, hps.train.learning_rate, epoch, os.path.join(hps.model_dir, "D_{}.pth".format(global_step)))
+-    global_step += 1
+-
+-  
+-  if rank == 0:
+-    logger.info('====> Epoch: {}'.format(epoch))
+-  
+-    
+-
+- 
+-def evaluate(hps, generator, eval_loader, writer_eval):
+-    generator.eval()
+-    with torch.no_grad():
+-      for batch_idx, (x, x_lengths, spec, spec_lengths, y, y_lengths) in enumerate(eval_loader):
+-        x, x_lengths = x.cuda(0), x_lengths.cuda(0)
+-        spec, spec_lengths = spec.cuda(0), spec_lengths.cuda(0)
+-        y, y_lengths = y.cuda(0), y_lengths.cuda(0)
+-
+-        # remove else
+-        x = x[:1]
+-        x_lengths = x_lengths[:1]
+-        spec = spec[:1]
+-        spec_lengths = spec_lengths[:1]
+-        y = y[:1]
+-        y_lengths = y_lengths[:1]
+-        break
+-      y_hat, y_hat_mb, attn, mask, *_ = generator.module.infer(x, x_lengths, max_len=1000)
+-      y_hat_lengths = mask.sum([1,2]).long() * hps.data.hop_length
+-
+-      mel = spec_to_mel_torch(
+-        spec, 
+-        hps.data.filter_length, 
+-        hps.data.n_mel_channels, 
+-        hps.data.sampling_rate,
+-        hps.data.mel_fmin, 
+-        hps.data.mel_fmax)
+-      y_hat_mel = mel_spectrogram_torch(
+-        y_hat.squeeze(1).float(),
+-        hps.data.filter_length,
+-        hps.data.n_mel_channels,
+-        hps.data.sampling_rate,
+-        hps.data.hop_length,
+-        hps.data.win_length,
+-        hps.data.mel_fmin,
+-        hps.data.mel_fmax
+-      )
+-    image_dict = {
+-      "gen/mel": utils.plot_spectrogram_to_numpy(y_hat_mel[0].cpu().numpy())
+-    }
+-    audio_dict = {
+-      "gen/audio": y_hat[0,:,:y_hat_lengths[0]]
+-    }
+-    if global_step == 0:
+-      image_dict.update({"gt/mel": utils.plot_spectrogram_to_numpy(mel[0].cpu().numpy())})
+-      audio_dict.update({"gt/audio": y[0,:,:y_lengths[0]]})
+-
+-    utils.summarize(
+-      writer=writer_eval,
+-      global_step=global_step, 
+-      images=image_dict,
+-      audios=audio_dict,
+-      audio_sampling_rate=hps.data.sampling_rate
+-    )
+-    generator.train()
+-
+-                           
++    global global_step
++    assert torch.cuda.is_available(), "CUDA required"
++    hps = utils.get_hparams()  # parses -c/-m, mirrors config to logs/<m>/config.json
++
++    rank = int(os.environ.get("LOCAL_RANK", 0))
++    grank = int(os.environ.get("RANK", rank))
++    world = int(os.environ.get("WORLD_SIZE", 1))
++    dist.init_process_group(backend="nccl", init_method="env://", world_size=world, rank=grank)
++    torch.cuda.set_device(rank)
++    torch.manual_seed(hps.train.seed)
++
++    d, tr = hps.data, hps.train
++    hop, seg = d.hop_length, tr.segment_size
++
++    # ---- hop-identity + arch asserts (rank 0 loud, all ranks enforce) ----
++    prod = 1
++    for u in hps.model.upsample_rates:
++        prod *= u
++    assert prod * hps.model.gen_istft_hop_size * hps.model.subbands == hop, (
++        f"hop identity fail: prod(up)={prod} * istft_hop={hps.model.gen_istft_hop_size} "
++        f"* subbands={hps.model.subbands} != hop_length={hop}")
++
++    is_main = (grank == 0)
++    logger = writer = None
++    if is_main:
++        logger = utils.get_logger(hps.model_dir)
++        logger.info(hps)
++        utils.check_git_hash(hps.model_dir)
++        writer = SummaryWriter(log_dir=hps.model_dir)
++        logger.info(f"[assert] hop identity OK: {prod}*{hps.model.gen_istft_hop_size}*"
++                    f"{hps.model.subbands} == {hop}")
++
++    # ---- data ----
++    train_dataset = JsonlTextAudioLoader(d.training_files, d)
++    # data_utils builds .lengths BEFORE shuffling rows; re-derive so the bucket
++    # sampler's lengths line up with the (shuffled) row order (verified files
++    # are left untouched -- fix lives here only).
++    train_dataset.lengths = [r["_spec_len_est"] for r in train_dataset.rows]
++    train_sampler = DistributedBucketSampler(
++        train_dataset, tr.batch_size,
++        [32, 300, 400, 500, 600, 700, 800, 900, 1000],
++        num_replicas=world, rank=grank, shuffle=True)
++    collate_fn = JsonlTextAudioCollate()
++    train_loader = DataLoader(train_dataset, num_workers=8, shuffle=False, pin_memory=True,
++                              collate_fn=collate_fn, batch_sampler=train_sampler,
++                              persistent_workers=True)
++    if is_main:
++        logger.info(f"[data] train utts (post-filter) = {len(train_dataset)}  "
++                    f"batch/gpu = {tr.batch_size}  world = {world}  "
++                    f"steps/epoch ~ {len(train_sampler)}")
++
++    # ---- models ----
++    net_g = SynthesizerTrn(VOCAB, d.filter_length // 2 + 1, seg // hop,
++                           **hps.model.__dict__).cuda(rank)
++    net_d = MultiPeriodDiscriminator(hps.model.use_spectral_norm).cuda(rank)
++
++    # ---- QAT (env-gated, no-op unless MBVITS_QAT=1) ----
++    # Load the converged fp32 weights into the RAW model FIRST (state-dict keys match the
++    # fp32 checkpoint), THEN wrap Conv1d/Linear with ORT-matched int8 fake-quant. Order
++    # matters: wrap_qat uses register_parametrization on plain-weight layers, which renames
++    # state-dict keys — so wrapping before the warm-start load would break it. After wrapping,
++    # QAT checkpoints save WITH the parametrized keys, so the normal resume-load below works.
++    # Warm-start files are logs/<name>/warmstart_{G,D}.pth (NOT G_0.pth, so the resume path
++    # sees no G_*.pth on a fresh QAT start and correctly begins at step 0). Reusable v2/v2.1/A24.
++    qat_on = os.environ.get("MBVITS_QAT") == "1"
++    if qat_on:
++        sys.path.insert(0, "/home/luigi/mbvits_run/qat")
++        from qat_fakequant import wrap_qat
++        wsg = os.path.join(hps.model_dir, "warmstart_G.pth")
++        wsd = os.path.join(hps.model_dir, "warmstart_D.pth")
++        if os.path.exists(wsg):
++            net_g.load_state_dict(torch.load(wsg, map_location="cpu")["model"], strict=True)
++            if is_main: logger.info(f"[qat] warm-started net_g from {wsg}")
++        if os.path.exists(wsd):
++            net_d.load_state_dict(torch.load(wsd, map_location="cpu")["model"], strict=True)
++            if is_main: logger.info(f"[qat] warm-started net_d from {wsd}")
++        quant_act = os.environ.get("MBVITS_QAT_ACT", "1") == "1"
++        # weight granularity MUST match deployment: static-QDQ int8 is per-tensor -> default per-tensor here.
++        w_pc = os.environ.get("MBVITS_QAT_WPC", "0") == "1"
++        wrap_qat(net_g, quantize_activations=quant_act, verbose=is_main, weight_per_channel=w_pc)
++        net_g = net_g.cuda(rank)  # wrap_qat adds activation-observer buffers on CPU; move them to GPU before DDP
++        if is_main:
++            logger.info(f"[qat] fake-quant engaged (act={'on' if quant_act else 'off'}, weight={'per-channel' if w_pc else 'per-tensor'})")
++
++    # ---- causal streaming vocoder finetune (env-gated, no-op unless MBVITS_CAUSAL=1) ----
++    # Warm-start G+D from logs/<name>/warmstart_{G,D}.pth (same pattern as QAT), then make
++    # every conv in the decoder left-causal (state-dict keys/shapes unchanged). By default
++    # only dec (+ full D) trains; the rest of net_g is frozen so enc/flow/dp stay bit-
++    # identical to the parent checkpoint (streaming design: vocoder is the one new piece).
++    causal_on = os.environ.get("MBVITS_CAUSAL") == "1"
++    if causal_on:
++        assert not qat_on, "MBVITS_CAUSAL and MBVITS_QAT are mutually exclusive"
++        from causal_patch import causalize_generator
++        wsg = os.path.join(hps.model_dir, "warmstart_G.pth")
++        wsd = os.path.join(hps.model_dir, "warmstart_D.pth")
++        if os.path.exists(wsg):
++            net_g.load_state_dict(torch.load(wsg, map_location="cpu")["model"], strict=True)
++            if is_main: logger.info(f"[causal] warm-started net_g from {wsg}")
++        if os.path.exists(wsd):
++            net_d.load_state_dict(torch.load(wsd, map_location="cpu")["model"], strict=True)
++            if is_main: logger.info(f"[causal] warm-started net_d from {wsd}")
++        causalize_generator(net_g.dec, verbose=is_main)
++        if os.environ.get("MBVITS_CAUSAL_FREEZE", "1") == "1":
++            n_frozen = 0
++            for n, p in net_g.named_parameters():
++                if not n.startswith("dec."):
++                    p.requires_grad_(False); n_frozen += 1
++            if is_main: logger.info(f"[causal] froze {n_frozen} non-dec param tensors (enc/flow/dp fixed)")
++
++    # ---- Phase-3 streaming ENCODER finetune (env-gated MBVITS_STREAM_ENC=1) ----
++    # Warm-start from the causal-vocoder checkpoint (dec already causal+good), keep the
++    # decoder causal & FROZEN, and finetune the band-attention/causal-FFN encoder (+flow,
++    # +dp) so quality holds under the restricted attention. Encoder streaming is baked in
++    # at construction via attentions._STREAM_ENC (same env). State-dict keys are unchanged
++    # (band mask + causal padding are runtime-only) so warm-start loads strict=True.
++    stream_enc_on = os.environ.get("MBVITS_STREAM_ENC") == "1"
++    if stream_enc_on:
++        assert not qat_on and not causal_on, "MBVITS_STREAM_ENC is standalone"
++        from causal_patch import causalize_generator
++        wsg = os.path.join(hps.model_dir, "warmstart_G.pth")
++        wsd = os.path.join(hps.model_dir, "warmstart_D.pth")
++        if os.path.exists(wsg):
++            net_g.load_state_dict(torch.load(wsg, map_location="cpu")["model"], strict=True)
++            if is_main: logger.info(f"[stream-enc] warm-started net_g from {wsg}")
++        if os.path.exists(wsd):
++            net_d.load_state_dict(torch.load(wsd, map_location="cpu")["model"], strict=True)
++            if is_main: logger.info(f"[stream-enc] warm-started net_d from {wsd}")
++        causalize_generator(net_g.dec, verbose=is_main)   # keep vocoder causal
++        n_frozen = 0
++        for n, p in net_g.named_parameters():
++            if n.startswith("dec."):
++                p.requires_grad_(False); n_frozen += 1
++        if is_main:
++            import attentions as _A
++            logger.info(f"[stream-enc] band-attn lookahead={_A._ENC_LOOKAHEAD} past={_A._ENC_PAST} "
++                        f"causal-FFN=on; froze {n_frozen} dec param tensors")
++
++    # ---- generic warm-start (env-gated): plain finetune from logs/<name>/warmstart_{G,D}.pth.
++    # Loads strict=True and begins at step 0 (no G_*.pth resume, no optimizer) — used for
++    # multi-speaker extension (e.g. v2.2 = v2.1 + a new emb_g row). Not combinable with the
++    # qat/causal/stream-enc paths, which already warm-start themselves.
++    warmstart_on = os.environ.get("MBVITS_WARMSTART") == "1"
++    if warmstart_on:
++        assert not (qat_on or causal_on or stream_enc_on), "MBVITS_WARMSTART is standalone"
++        wsg = os.path.join(hps.model_dir, "warmstart_G.pth")
++        wsd = os.path.join(hps.model_dir, "warmstart_D.pth")
++        if os.path.exists(wsg):
++            net_g.load_state_dict(torch.load(wsg, map_location="cpu")["model"], strict=True)
++            if is_main: logger.info(f"[warmstart] net_g from {wsg}")
++        if os.path.exists(wsd):
++            net_d.load_state_dict(torch.load(wsd, map_location="cpu")["model"], strict=True)
++            if is_main: logger.info(f"[warmstart] net_d from {wsd}")
++
++    if is_main:
++        ng = sum(p.numel() for p in net_g.parameters()) / 1e6
++        nd = sum(p.numel() for p in net_d.parameters()) / 1e6
++        logger.info(f"[assert] net_g params = {ng:.2f}M  net_d params = {nd:.2f}M")
++        # v2-specific band check; skip for QAT and for multi-speaker (gin adds emb_g+cond params)
++        # and smaller archs (A24) — those reuse train_latest with different param counts.
++        if not qat_on and getattr(hps.model, "n_speakers", 0) == 0 and not getattr(hps.model, "skip_param_band", False):
++            assert 33.0 < ng < 36.5, f"net_g param count {ng:.2f}M out of expected ~34.7M band"
++
++    optim_g = torch.optim.AdamW(net_g.parameters(), tr.learning_rate, betas=tr.betas, eps=tr.eps)
++    optim_d = torch.optim.AdamW(net_d.parameters(), tr.learning_rate, betas=tr.betas, eps=tr.eps)
++    net_g = DDP(net_g, device_ids=[rank])
++    net_d = DDP(net_d, device_ids=[rank])
++
++    try:
++        _, _, _, epoch_str = utils.load_checkpoint(
++            utils.latest_checkpoint_path(hps.model_dir, "G_*.pth"), net_g, optim_g)
++        _, _, _, epoch_str = utils.load_checkpoint(
++            utils.latest_checkpoint_path(hps.model_dir, "D_*.pth"), net_d, optim_d)
++        global_step = (epoch_str - 1) * len(train_loader)
++        if is_main:
++            logger.info(f"[resume] from epoch {epoch_str}, global_step {global_step}")
++    except Exception:
++        epoch_str = 1
++        global_step = 0
++
++    scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=tr.lr_decay, last_epoch=epoch_str - 2)
++    scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optim_d, gamma=tr.lr_decay, last_epoch=epoch_str - 2)
++
++    keep = getattr(tr, "keep_last_ckpts", 6)
++    nan_skips = 0
++    t0 = time.time()
++
++    for epoch in range(epoch_str, tr.epochs + 1):
++        train_sampler.set_epoch(epoch)
++        net_g.train(); net_d.train()
++        for batch in train_loader:
++            phone, tone, lang, xlen, spec, slen, wav, wlen, sid = [
++                b.cuda(rank, non_blocking=True) for b in batch]
++
++            y_hat, y_hat_mb, l_length, attn, ids_slice, x_mask, z_mask, \
++                (z, z_p, m_p, logs_p, m_q, logs_q) = net_g(phone, tone, lang, xlen, spec, slen, sid=sid)
++
++            mel = spec_to_mel_torch(spec, d.filter_length, d.n_mel_channels,
++                                    d.sampling_rate, d.mel_fmin, d.mel_fmax)
++            y_mel = commons.slice_segments(mel, ids_slice, seg // hop)
++            y_hat_mel = mel_spectrogram_torch(y_hat.squeeze(1), d.filter_length, d.n_mel_channels,
++                                              d.sampling_rate, hop, d.win_length, d.mel_fmin, d.mel_fmax)
++            y = commons.slice_segments(wav, ids_slice * hop, seg)
++
++            # ---- discriminator ----
++            y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
++            loss_disc, _, _ = discriminator_loss(y_d_hat_r, y_d_hat_g)
++            optim_d.zero_grad()
++            loss_disc.backward()
++            grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
++            optim_d.step()
++
++            # ---- generator ----
++            y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
++            loss_dur = torch.sum(l_length.float())
++            loss_mel = F.l1_loss(y_mel, y_hat_mel) * tr.c_mel
++            loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * tr.c_kl
++            loss_fm = feature_loss(fmap_r, fmap_g)
++            loss_gen, _ = generator_loss(y_d_hat_g)
++            y_mb = PQMF(y.device).analysis(y)
++            loss_subband = subband_stft_loss(hps, y_mb, y_hat_mb)
++            loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl + loss_subband
++
++            if not torch.isfinite(loss_gen_all):
++                nan_skips += 1
++                optim_g.zero_grad(set_to_none=True)
++                if is_main:
++                    logger.warning(f"[nan] non-finite loss at step {global_step} "
++                                   f"(skip #{nan_skips}); gen_all={loss_gen_all.item()}")
++                global_step += 1
++                continue
++
++            optim_g.zero_grad()
++            loss_gen_all.backward()
++            grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
++            optim_g.step()
++
++            if is_main and global_step % tr.log_interval == 0:
++                lr = optim_g.param_groups[0]["lr"]
++                dt = time.time() - t0
++                sps = dt / max(1, global_step) if global_step else 0.0
++                logger.info(
++                    f"step {global_step:7d} ep {epoch} "
++                    f"gen_all={loss_gen_all.item():7.3f} mel={loss_mel.item():6.3f} "
++                    f"kl={loss_kl.item():6.3f} dur={loss_dur.item():7.2f} fm={loss_fm.item():6.3f} "
++                    f"gen={loss_gen.item():5.3f} sub={loss_subband.item():5.3f} "
++                    f"disc={loss_disc.item():5.3f} | {sps:.2f}s/it nan_skips={nan_skips}")
++                writer.add_scalar("loss/g/total", loss_gen_all.item(), global_step)
++                writer.add_scalar("loss/d/total", loss_disc.item(), global_step)
++                writer.add_scalar("loss/g/mel", loss_mel.item(), global_step)
++                writer.add_scalar("loss/g/kl", loss_kl.item(), global_step)
++                writer.add_scalar("loss/g/dur", loss_dur.item(), global_step)
++                writer.add_scalar("loss/g/fm", loss_fm.item(), global_step)
++                writer.add_scalar("loss/g/gen", loss_gen.item(), global_step)
++                writer.add_scalar("loss/g/subband", loss_subband.item(), global_step)
++                writer.add_scalar("learning_rate", lr, global_step)
++                writer.add_scalar("grad/g", grad_norm_g, global_step)
++                writer.add_scalar("grad/d", grad_norm_d, global_step)
++
++            if is_main and global_step > 0 and global_step % tr.eval_interval == 0:
++                utils.save_checkpoint(net_g, optim_g, tr.learning_rate, epoch,
++                                      os.path.join(hps.model_dir, f"G_{global_step}.pth"))
++                utils.save_checkpoint(net_d, optim_d, tr.learning_rate, epoch,
++                                      os.path.join(hps.model_dir, f"D_{global_step}.pth"))
++                _prune_ckpts(hps.model_dir, keep)
++                logger.info(f"[ckpt] saved G_{global_step}.pth / D_{global_step}.pth "
++                            f"(keep_last={keep})")
++
++            global_step += 1
++
++        scheduler_g.step()
++        scheduler_d.step()
++        if is_main:
++            logger.info(f"====> Epoch {epoch} done (global_step {global_step})")
++
++
+ if __name__ == "__main__":
+-  os.environ[
+-        "TORCH_DISTRIBUTED_DEBUG"
+-    ] = "DETAIL"
+-  main()
++    main()
